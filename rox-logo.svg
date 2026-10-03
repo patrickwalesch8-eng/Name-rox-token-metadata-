@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#0B0B0D"/>
+  <circle cx="256" cy="256" r="196" fill="#111216" stroke="#D9A72E" stroke-width="18"/>
+  <circle cx="256" cy="256" r="164" fill="none" stroke="#6F5520" stroke-width="4"/>
+  <path d="M168 190 L256 112 L344 190" fill="none" stroke="#D9A72E" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M188 326 L256 388 L324 326" fill="none" stroke="#D9A72E" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="256" y="292" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="118" font-weight="800" letter-spacing="-8" fill="#F4C451">ROX</text>
+  <text x="256" y="340" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="600" letter-spacing="12" fill="#D9A72E">COIN</text>
+</svg>
