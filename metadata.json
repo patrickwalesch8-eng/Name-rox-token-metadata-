@@ -1,0 +1,30 @@
+{
+  "name": "ROX Coin",
+  "symbol": "ROX",
+  "description": "ROX Coin is a fungible test token on Solana Devnet.",
+  "image": "https://raw.githubusercontent.com/patrickwalesch8-eng/Name-rox-token-metadata-/main/rox-logo.svg",
+  "external_url": "https://github.com/patrickwalesch8-eng/Name-rox-token-metadata-",
+  "attributes": [
+    {
+      "trait_type": "Type",
+      "value": "Fungible Token"
+    },
+    {
+      "trait_type": "Network",
+      "value": "Solana Devnet"
+    },
+    {
+      "trait_type": "Supply",
+      "value": "100000000"
+    }
+  ],
+  "properties": {
+    "files": [
+      {
+        "uri": "https://raw.githubusercontent.com/patrickwalesch8-eng/Name-rox-token-metadata-/main/rox-logo.svg",
+        "type": "image/svg+xml"
+      }
+    ],
+    "category": "image"
+  }
+}
