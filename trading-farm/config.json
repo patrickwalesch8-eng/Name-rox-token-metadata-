@@ -19,6 +19,7 @@
     "max_risk_atr": 3.0,
     "no_entry_before": "09:45",
     "no_entry_after": "15:30",
+    "flat_at": "15:55",
     "max_trades_per_day": 2,
     "use_htf_bias": true
   },

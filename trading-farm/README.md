@@ -53,6 +53,13 @@ Hinweise:
 - Das Repo ist öffentlich, also ist auch diese Seite öffentlich. Es sind nur Kursdaten und Statistiken zu sehen, keine Kontodaten.
 - Yahoo blockiert Server-Anfragen gelegentlich. Dann zeigt die Seite einfach den letzten Stand.
 
+## TradingView-Version (Alarme rund um die Uhr)
+
+Im Ordner [`tradingview/`](tradingview/) liegt dieselbe Strategie als Pine Script für
+TradingView. Sie zeichnet alle Muster in den Chart und läuft im Strategietester. Die Alarme
+laufen auf den TradingView-Servern, also auch wenn dein PC aus ist.
+Die Anleitung steht in [`tradingview/ANLEITUNG.md`](tradingview/ANLEITUNG.md).
+
 ## Was die Farm erkennt
 
 | Event | Bedeutung |
@@ -75,7 +82,7 @@ auf der es wirklich feststeht, also **ohne Blick in die Zukunft**. Die Tests pr�
 3. Die Einstiegszone ist das neueste **FVG** dieser Bewegung, sonst der **Order Block**.
 4. Eine **Limit-Order** wartet `entry_window` Kerzen am Rand der Zone.
 5. Der **Stop** liegt hinter dem Sweep-Docht, das **Ziel** bei `target_rr` × Risiko.
-   Spätestens zum Börsenschluss wird die Position glattgestellt.
+   Spätestens mit der Kerze, die um `flat_at` (15:55 New York) endet, wird glattgestellt.
 
 Filter, die zu einer Ablehnung führen können: 1h-Trend dagegen, Handelszeitfenster,
 Risiko zu groß oder zu klein, Tageslimit, Position schon offen.

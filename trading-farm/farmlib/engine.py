@@ -5,7 +5,8 @@ Chain (mirrored for longs):
   2. within `mss_window` bars a bearish MSS/BOS confirms the reversal
   3. entry zone = newest bearish FVG of that leg, else the order block of the break
   4. a limit order waits `entry_window` bars at the zone edge
-  5. stop beyond the sweep extreme, target at `target_rr` x risk, flat at the close
+  5. stop beyond the sweep extreme, target at `target_rr` x risk, flat with the
+     bar that ends at `flat_at` (default 15:55, so an alert still arrives before the bell)
 
 Every candidate that does not become a trade is kept as a refusal with its
 reason, so the farm can study what the engine passed on.
@@ -40,6 +41,8 @@ def run_engine(df, events, atr_arr, sym, cfg, costs, bias=None):
     day, mins = df.day.values, df.mins.values
     n = len(df)
     first_m, last_m = hhmm(cfg["no_entry_before"]), hhmm(cfg["no_entry_after"])
+    flat_m = hhmm(cfg.get("flat_at", "16:00"))
+    bar_min = 5
 
     by_i = {}
     for e in events:
@@ -71,7 +74,7 @@ def run_engine(df, events, atr_arr, sym, cfg, costs, bias=None):
                    net=round(gross - cost_r(pos["entry"], pos["risk"]), 3))
         trades.append(pos)
 
-    def arm(base, brk, i, evs):
+    def arm(base, brk, i, evs, last_bar):
         """MSS confirmed a candidate: pick the entry zone and place the order - or refuse."""
         short = base["dir"] == "short"
         want = "bear" if short else "bull"
@@ -89,6 +92,8 @@ def run_engine(df, events, atr_arr, sym, cfg, costs, bias=None):
         if zone is None:
             return refuse("keine_zone", i, base, **info)
         info["zone"] = zone
+        if last_bar:
+            return refuse("sessionende", i, base, **info)
         if st["pos"] is not None or st["order"] is not None:
             return refuse("position_offen", i, base, **info)
         if per_day.get(day[i], 0) >= cfg["max_trades_per_day"]:
@@ -127,7 +132,8 @@ def run_engine(df, events, atr_arr, sym, cfg, costs, bias=None):
         return out
 
     for i in range(n):
-        last_bar = i == n - 1 or day[i + 1] != day[i]
+        # session end: last bar of the day, or the bar that ends at/after flat_at
+        last_bar = i == n - 1 or day[i + 1] != day[i] or mins[i] + bar_min >= flat_m
 
         # 1) manage the open position (from the bar after the fill)
         pos = st["pos"]
@@ -175,14 +181,14 @@ def run_engine(df, events, atr_arr, sym, cfg, costs, bias=None):
             brk = next((e for e in evs if e["k"] in ("mss", "bos") and e["d"] == want), None)
             if brk is not None:
                 st["cand"] = None
-                arm(cand, brk, i, evs)
+                arm(cand, brk, i, evs, last_bar)
             elif i - cand["i"] >= cfg["mss_window"] or last_bar:
                 refuse("kein_mss", i, cand)
                 st["cand"] = None
 
-        # 4) a fresh sweep starts a new candidate
+        # 4) a fresh sweep starts a new candidate (not in the closing bars)
         for e in evs:
-            if e["k"] == "sweep":
+            if e["k"] == "sweep" and not last_bar:
                 if st["cand"] is not None:
                     refuse("ersetzt", i, st["cand"])
                 st["cand"] = {"dir": "short" if e["d"] == "bear" else "long", "sweep": e, "i": i}

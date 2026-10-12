@@ -65,6 +65,23 @@ class EngineChain(unittest.TestCase):
                 self.assertTrue(t["sl"] < t["entry"] < t["tp"])
 
 
+class SessionEnd(unittest.TestCase):
+    def test_flat_before_the_bell(self):
+        """Positions are closed with the bar that ends at flat_at; nothing new starts there."""
+        df = data.add_session_cols(data.make_demo("FLAT", days=60, seed=11))
+        ev, a = detect(df, "FLAT", "5m", CFG["detect"])
+        trades, refusals = run_engine(df, ev, a, "FLAT", CFG["engine"], CFG["costs"])
+        hh, mm = CFG["engine"]["flat_at"].split(":")
+        flat_bar_start = int(hh) * 60 + int(mm) - 5
+        mins_of = dict(zip(df.t.values.tolist(), df.mins.values.tolist()))
+        for t in trades:
+            self.assertLessEqual(mins_of[t["exit_t"]], flat_bar_start)
+            self.assertLessEqual(mins_of[t["fill_t"]], flat_bar_start)
+            self.assertLess(mins_of[t["armed_t"]], flat_bar_start)
+        for r in refusals:  # sweeps in the closing bars never start a candidate
+            self.assertLess(mins_of[r["sweep_t"]], flat_bar_start)
+
+
 class Aggregation(unittest.TestCase):
     def test_hour_bars_match_5m(self):
         df = data.add_session_cols(data.make_demo("AGG", days=3, seed=1))

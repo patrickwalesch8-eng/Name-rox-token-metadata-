@@ -8,9 +8,19 @@
 //              -> Stop hinter dem Sweep-Docht -> Ziel = RR x Risiko -> flat zum Schluss
 // Alles wird erst auf der Kerze gemeldet, auf der es feststeht (kein Repainting).
 // Gedacht fuer 5-Minuten-Charts von US-Aktien, reguläre Handelszeit (Extended Hours aus).
+//
+// Alarm anlegen: Bedingung = diese Strategie -> "alert() function calls only"
+// (nicht "Order fills ..." - sonst kommt jede Meldung doppelt). Nach jeder Änderung
+// am Script oder an den Einstellungen den Alarm löschen und neu anlegen.
+//
+// Unterschiede zur Python-Version, die sich nicht vermeiden lassen: TradingViews
+// Broker-Emulator entscheidet innerhalb einer Kerze anhand von O/H/L/C, ob Stop oder
+// Ziel zuerst erreicht wurde (Python: immer der Stop), Kurslücken füllen zum
+// Eröffnungskurs, und die ATR startet erst nach 14 Kerzen. Die 0,02 % Kommission je
+// Seite entsprechen den 2 bps Slippage aus config.json.
 
 //@version=6
-strategy("Aktien Data Farm · SMC Engine", shorttitle = "ADF", overlay = true, initial_capital = 10000, currency = currency.USD, commission_type = strategy.commission.percent, commission_value = 0.02, pyramiding = 0, max_bars_back = 500, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+strategy("Aktien Data Farm · SMC Engine", shorttitle = "ADF", overlay = true, initial_capital = 10000, currency = currency.USD, commission_type = strategy.commission.percent, commission_value = 0.02, pyramiding = 0, margin_long = 0, margin_short = 0, max_bars_back = 500, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
 
 // ───────────────────────────── Eingaben
 const string G_DET = "Erkennung"
@@ -35,6 +45,7 @@ float  minRisk  = input.float(0.3, "Risiko mindestens (× ATR)", minval = 0.0, s
 float  maxRisk  = input.float(3.0, "Risiko höchstens (× ATR)", minval = 0.1, step = 0.1, group = G_ENG)
 string tStart   = input.string("09:45", "Kein Einstieg vor (New York)", group = G_ENG)
 string tEnd     = input.string("15:30", "Kein Einstieg nach (New York)", group = G_ENG)
+string tFlat    = input.string("15:55", "Glattstellen mit der Kerze, die endet um (New York)", group = G_ENG)
 int    maxTrades = input.int(2, "Max. Trades pro Tag", minval = 1, group = G_ENG)
 bool   useBias  = input.bool(true, "Nur mit dem Trend des höheren Timeframes", group = G_ENG)
 string htfTf    = input.timeframe("60", "Höherer Timeframe", group = G_ENG)
@@ -136,8 +147,13 @@ f_newZone(int dir, float top, float bot, int x1, string txt, color col, bool sho
     Zone.new(dir, top, bot, bar_index, false, bx)
 
 f_hm(string s) =>
-    array<string> parts = str.split(s, ":")
-    int(str.tonumber(parts.get(0))) * 60 + int(str.tonumber(parts.get(1)))
+    array<string> parts = str.split(str.trim(s), ":")
+    int res = na
+    if parts.size() == 2
+        res := int(str.tonumber(parts.get(0))) * 60 + int(str.tonumber(parts.get(1)))
+    if na(res)
+        runtime.error("Zeit bitte als HH:MM eingeben, z. B. 09:45 (eingegeben: '" + s + "')")
+    res
 
 f_px(float x) =>
     str.tostring(x, format.mintick)
@@ -153,9 +169,9 @@ f_refuse(map<string, int> m, string reason) =>
     if showRefuse
         label.new(bar_index, high, "×", style = label.style_label_down, color = C_NONE, textcolor = C_DIM, size = size.small, tooltip = "abgelehnt: " + reason)
 
-f_msg(string event, string text, int dir, float price, float sl, float tp) =>
+f_msg(string event, string text, int dir, float price, float sl, float tp, string oid = "") =>
     string side = dir == 1 ? "buy" : "sell"
-    jsonMsg ? '{"bot":"ADF","event":"' + event + '","ticker":"' + syminfo.ticker + '","side":"' + side + '","price":' + f_num(price) + ',"sl":' + f_num(sl) + ',"tp":' + f_num(tp) + '}' : "ADF " + syminfo.ticker + " · " + text
+    jsonMsg ? '{"bot":"ADF","event":"' + event + '","id":"' + oid + '","ticker":"' + syminfo.ticker + '","side":"' + side + '","price":' + f_num(price) + ',"sl":' + f_num(sl) + ',"tp":' + f_num(tp) + '}' : "ADF " + syminfo.ticker + " · " + text
 
 // Richtung des letzten Strukturbruchs (für den höheren Timeframe)
 f_structDir(int k) =>
@@ -179,19 +195,30 @@ f_structDir(int k) =>
         dir := -1
     dir
 
+// aktueller und vorheriger HTF-Wert in einem Request
+f_htfPair(int k) =>
+    int d = f_structDir(k)
+    [d, d[1]]
+
 // ───────────────────────────── Grundwerte je Kerze
 float atr      = ta.atr(14)
 float volRatio = volume / math.max(1.0, ta.sma(volume, 21))
 int   poolAge  = math.round(2 * 390 * 60 / timeframe.in_seconds())
 int   nyMin    = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
-bool  newDay   = session.isfirstbar_regular
-bool  lastBar  = session.islastbar_regular
+float tfMin    = timeframe.in_seconds() / 60.0
 int   startMin = f_hm(tStart)
 int   endMin   = f_hm(tEnd)
+int   flatMin  = f_hm(tFlat)
+bool  newDay   = session.isfirstbar_regular
+// Schluss-Kerze(n): ab der Kerze, die um tFlat endet, wird glattgestellt und nichts Neues begonnen
+bool  lastBar  = session.islastbar_regular or (session.ismarket and nyMin + tfMin >= flatMin)
 
-// HTF-Trend der letzten abgeschlossenen HTF-Kerze (lookahead_on + [1] = kein Repainting)
-int htfRaw = request.security(syminfo.tickerid, htfTf, f_structDir(swingK)[1], lookahead = barmerge.lookahead_on)
-int htfDir = useBias ? nz(htfRaw) : 0
+// HTF-Trend: ein HTF-Strukturbruch zählt ab dem Schluss seiner HTF-Kerze (wie in Python).
+// Auf der Chart-Kerze, die gleichzeitig mit der HTF-Kerze schließt, ist deren Wert final;
+// sonst gilt der Wert der letzten abgeschlossenen HTF-Kerze -> kein Repainting.
+[htfCur, htfPrev] = request.security(syminfo.tickerid, htfTf, f_htfPair(swingK), lookahead = barmerge.lookahead_on)
+bool htfBarDone = time_close == time_close(htfTf) and not session.islastbar_regular
+int  htfDir = useBias ? nz(htfBarDone ? htfCur : htfPrev) : 0
 
 // ───────────────────────────── Zustand der Erkennung
 var array<Pool>  pools    = array.new<Pool>()
@@ -334,7 +361,7 @@ if bar_index >= 2 * swingK
                     break
         shBars.push(p)
         shPrices.push(ph)
-        if shBars.size() > 100
+        while shBars.size() > 1 and p - shBars.first() > eqLook
             shBars.shift()
             shPrices.shift()
         lastSH    := ph
@@ -359,7 +386,7 @@ if bar_index >= 2 * swingK
                     break
         slBars.push(p)
         slPrices.push(pLo)
-        if slBars.size() > 100
+        while slBars.size() > 1 and p - slBars.first() > eqLook
             slBars.shift()
             slPrices.shift()
         lastSL    := pLo
@@ -420,7 +447,7 @@ if bar_index >= 2
         lastBearFvgTop := low[2]
         lastBearFvgBot := high
 
-if pools.size() > 200
+if pools.size() > 500
     pools.shift()
 if fvgs.size() > 200
     fvgs.shift()
@@ -454,6 +481,20 @@ var map<string, float> riskById = map.new<string, float>()
 
 if newDay
     tradesToday := 0
+    // Sicherheitsnetz: falls die Schluss-Kerze nie kam (dünner Handel, Halbtag)
+    if strategy.position_size != 0 or ordDir != 0
+        bool hadPos = strategy.position_size != 0
+        strategy.cancel_all()
+        strategy.close_all(comment = "Failsafe", immediately = true)
+        if ordDir != 0
+            f_refuse(refusals, "sessionende")
+        if alertTrade and hadPos
+            alert(f_msg("exit", "Position über Nacht gefunden – glattgestellt @ " + f_px(close), posDir, close, na, na), alert.freq_once_per_bar_close)
+        ordDir := 0
+        posDir := 0
+    if candDir != 0
+        f_refuse(refusals, "kein_mss")
+        candDir := 0
 
 // a) wartende Limit-Order: gefüllt, ohne Retest weggelaufen oder abgelaufen
 if ordDir != 0
@@ -465,15 +506,21 @@ if ordDir != 0
         posRisk  := math.abs(ordSL - ordEntry)
         posSL    := ordSL
         posTP    := ordTP
+        // Ziel erst ab der Kerze nach dem Einstieg aktiv (wie in Python); der Stop gilt sofort
+        if strategy.position_size != 0 and not lastBar
+            strategy.exit("X" + ordId, from_entry = ordId, stop = ordSL, limit = ordTP, comment_loss = "Stop", comment_profit = "Ziel")
         if alertTrade
-            alert(f_msg("fill", (ordDir == 1 ? "LONG" : "SHORT") + " Einstieg @ " + f_px(ordEntry) + " · SL " + f_px(ordSL) + " · TP " + f_px(ordTP), ordDir, ordEntry, ordSL, ordTP), alert.freq_once_per_bar_close)
+            alert(f_msg("fill", (ordDir == 1 ? "LONG" : "SHORT") + " Einstieg @ " + f_px(ordEntry) + " · SL " + f_px(ordSL) + " · TP " + f_px(ordTP), ordDir, ordEntry, ordSL, ordTP, ordId), alert.freq_once_per_bar_close)
         ordDir := 0
     else
         bool ranAway = ordDir == 1 ? high >= ordTP : low <= ordTP
         if ranAway or bar_index >= ordExpire or lastBar
             strategy.cancel(ordId)
             strategy.cancel("X" + ordId)
-            f_refuse(refusals, ranAway ? "lief_ohne_retest" : lastBar ? "sessionende" : "kein_retest")
+            string why = ranAway ? "lief_ohne_retest" : lastBar ? "sessionende" : "kein_retest"
+            f_refuse(refusals, why)
+            if alertSetup
+                alert(f_msg("cancel", (ordDir == 1 ? "LONG" : "SHORT") + " Limit " + f_px(ordEntry) + " streichen (" + why + ")", ordDir, ordEntry, na, na, ordId), alert.freq_once_per_bar_close)
             ordDir := 0
 
 // b) abgeschlossene Trades auswerten (Stop/Ziel werden vom Broker-Emulator ausgeführt)
@@ -491,17 +538,18 @@ if strategy.closedtrades > seenClosed
             // EOD-Schlüsse wurden schon beim Schließen gemeldet
             if alertTrade and strategy.closedtrades.exit_bar_index(n) == bar_index
                 float grossR = (xp - ep) * sgn / risk
-                alert(f_msg("exit", (sgn == 1 ? "LONG" : "SHORT") + " geschlossen @ " + f_px(xp) + " · " + f_r(grossR) + " (netto " + f_r(netR) + ")", sgn, xp, na, na), alert.freq_once_per_bar_close)
+                alert(f_msg("exit", (sgn == 1 ? "LONG" : "SHORT") + " geschlossen @ " + f_px(xp) + " · " + f_r(grossR) + " (netto " + f_r(netR) + ")", sgn, xp, na, na, eid), alert.freq_once_per_bar_close)
     seenClosed := strategy.closedtrades
 if strategy.position_size == 0
     posDir := 0
 
 // c) Schluss der Session: alles glattstellen
 if lastBar and strategy.position_size != 0
+    string openId = strategy.opentrades.entry_id(0)
     strategy.close_all(comment = "Schluss", immediately = true)
     if alertTrade and posDir != 0 and posRisk > 0
         float r = (close - posEntry) * posDir / posRisk
-        alert(f_msg("exit", (posDir == 1 ? "LONG" : "SHORT") + " zum Schluss geschlossen @ " + f_px(close) + " · " + f_r(r) + " brutto", posDir, close, na, na), alert.freq_once_per_bar_close)
+        alert(f_msg("exit", (posDir == 1 ? "LONG" : "SHORT") + " zum Schluss glattstellen @ " + f_px(close) + " · " + f_r(r) + " brutto", posDir, close, na, na, openId), alert.freq_once_per_bar_close)
     posDir := 0
 
 // d) wartender Kandidat: Strukturbruch in Gegenrichtung macht das Setup scharf
@@ -533,8 +581,11 @@ if candDir != 0
         float  entry  = na
         float  sl     = na
         float  risk   = na
+        float  qty    = na
         if zKind == ""
             reason := "keine_zone"
+        else if lastBar
+            reason := "sessionende"
         else if ordDir != 0 or strategy.position_size != 0
             reason := "position_offen"
         else if tradesToday >= maxTrades
@@ -555,18 +606,21 @@ if candDir != 0
                 reason := "risiko_zu_klein"
             else if risk > maxRisk * atr
                 reason := "risiko_zu_gross"
+            else
+                // Stückzahl: riskPct vom Konto riskieren, höchstens 98 % des Kontos investieren
+                qty := math.min(math.floor(strategy.equity * riskPct / 100 / risk), math.floor(strategy.equity * 0.98 / entry))
+                if qty < 1
+                    reason := "kapital_zu_klein"
         if reason != ""
             f_refuse(refusals, reason)
         else
             float tp  = candDir == -1 ? entry - rr * risk : entry + rr * risk
-            float qty = math.floor(strategy.equity * riskPct / 100 / risk)
-            qty := math.max(1, math.min(qty, math.floor(strategy.equity / entry)))
             tradeSeq += 1
             ordId := (candDir == 1 ? "L" : "S") + str.tostring(tradeSeq)
             string dirTxt = candDir == 1 ? "LONG" : "SHORT"
             string setupTxt = dirTxt + "-Setup: Sweep " + candTag + " " + f_px(candLvl) + " → " + brkKind + " " + f_px(brkLvl) + " → " + zKind + " · Limit " + f_px(entry) + " · SL " + f_px(sl) + " · TP " + f_px(tp)
             strategy.entry(ordId, candDir == 1 ? strategy.long : strategy.short, qty = qty, limit = entry, comment = dirTxt + " " + zKind)
-            strategy.exit("X" + ordId, from_entry = ordId, stop = sl, limit = tp, comment_loss = "Stop", comment_profit = "Ziel")
+            strategy.exit("X" + ordId, from_entry = ordId, stop = sl, comment_loss = "Stop")
             riskById.put(ordId, risk)
             ordDir    := candDir
             ordEntry  := entry
@@ -576,14 +630,14 @@ if candDir != 0
             ordClosedBase := strategy.closedtrades
             label.new(bar_index, candDir == 1 ? low : high, "★ " + dirTxt + "\nLimit " + f_px(entry), style = candDir == 1 ? label.style_label_up : label.style_label_down, color = color.new(C_GOLD, 15), textcolor = color.black, size = size.small, tooltip = setupTxt)
             if alertSetup
-                alert(f_msg("setup", setupTxt, candDir, entry, sl, tp), alert.freq_once_per_bar_close)
+                alert(f_msg("setup", setupTxt, candDir, entry, sl, tp, ordId), alert.freq_once_per_bar_close)
         candDir := 0
     else if bar_index - candBar >= mssWin or lastBar
         f_refuse(refusals, "kein_mss")
         candDir := 0
 
 // e) neuer Sweep startet einen neuen Kandidaten
-if sweepCount > 0 and session.ismarket
+if sweepCount > 0 and session.ismarket and not lastBar
     if candDir != 0
         f_refuse(refusals, "ersetzt")
     if sweepCount > 1
