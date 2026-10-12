@@ -1,0 +1,639 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Aktien Data Farm · SMC Engine (TradingView-Version)
+//
+// Gleiche Logik wie die Python-Farm (trading-farm/farmlib):
+//   Erkennung: Swings HH/HL/LH/LL, Liquiditaets-Pools (EQH/EQL, PDH/PDL), Sweeps,
+//              BOS/MSS, Fair Value Gaps, Order Blocks
+//   Engine:    Sweep -> MSS/BOS in Gegenrichtung -> Limit im FVG (sonst OB)
+//              -> Stop hinter dem Sweep-Docht -> Ziel = RR x Risiko -> flat zum Schluss
+// Alles wird erst auf der Kerze gemeldet, auf der es feststeht (kein Repainting).
+// Gedacht fuer 5-Minuten-Charts von US-Aktien, reguläre Handelszeit (Extended Hours aus).
+
+//@version=6
+strategy("Aktien Data Farm · SMC Engine", shorttitle = "ADF", overlay = true, initial_capital = 10000, currency = currency.USD, commission_type = strategy.commission.percent, commission_value = 0.02, pyramiding = 0, max_bars_back = 500, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Eingaben
+const string G_DET = "Erkennung"
+const string G_ENG = "Engine"
+const string G_RSK = "Risiko"
+const string G_VIS = "Anzeige"
+const string G_ALR = "Alarme"
+
+int   swingK   = input.int(2, "Swing-Stärke (Kerzen je Seite)", minval = 1, maxval = 10, group = G_DET)
+float eqTol    = input.float(0.1, "Toleranz gleiche Hochs/Tiefs (× ATR)", minval = 0.0, step = 0.05, group = G_DET)
+int   eqLook   = input.int(60, "Rückblick gleiche Hochs/Tiefs (Kerzen)", minval = 5, maxval = 400, group = G_DET)
+float fvgMin   = input.float(0.25, "Mindestgröße FVG (× ATR)", minval = 0.0, step = 0.05, group = G_DET)
+int   fvgAge   = input.int(60, "FVG gültig (Kerzen)", minval = 5, group = G_DET)
+int   obAge    = input.int(120, "Order Block gültig (Kerzen)", minval = 5, group = G_DET)
+bool  usePdhl  = input.bool(true, "Vortageshoch/-tief als Pools", group = G_DET)
+
+int    mssWin   = input.int(12, "MSS muss kommen innerhalb (Kerzen)", minval = 1, group = G_ENG)
+int    entryWin = input.int(12, "Limit-Order wartet (Kerzen)", minval = 1, group = G_ENG)
+float  rr       = input.float(2.0, "Ziel (Chance-Risiko-Verhältnis)", minval = 0.5, step = 0.25, group = G_ENG)
+float  slBuf    = input.float(0.1, "Stop-Puffer hinter Sweep-Docht (× ATR)", minval = 0.0, step = 0.05, group = G_ENG)
+float  minRisk  = input.float(0.3, "Risiko mindestens (× ATR)", minval = 0.0, step = 0.1, group = G_ENG)
+float  maxRisk  = input.float(3.0, "Risiko höchstens (× ATR)", minval = 0.1, step = 0.1, group = G_ENG)
+string tStart   = input.string("09:45", "Kein Einstieg vor (New York)", group = G_ENG)
+string tEnd     = input.string("15:30", "Kein Einstieg nach (New York)", group = G_ENG)
+int    maxTrades = input.int(2, "Max. Trades pro Tag", minval = 1, group = G_ENG)
+bool   useBias  = input.bool(true, "Nur mit dem Trend des höheren Timeframes", group = G_ENG)
+string htfTf    = input.timeframe("60", "Höherer Timeframe", group = G_ENG)
+
+float riskPct = input.float(1.0, "Risiko pro Trade (% vom Konto)", minval = 0.1, maxval = 10, step = 0.1, group = G_RSK)
+
+bool showPools  = input.bool(true, "Liquiditäts-Pools", group = G_VIS)
+bool showSweeps = input.bool(true, "Sweeps", group = G_VIS)
+bool showSwings = input.bool(true, "Swings HH/HL/LH/LL", group = G_VIS)
+bool showBreaks = input.bool(true, "BOS / MSS", group = G_VIS)
+bool showFvg    = input.bool(true, "Fair Value Gaps", group = G_VIS)
+bool showOb     = input.bool(true, "Order Blocks", group = G_VIS)
+bool showRefuse = input.bool(true, "Abgelehnte Setups (×)", group = G_VIS)
+bool showTable  = input.bool(true, "Farm-Tabelle", group = G_VIS)
+
+bool alertSweep = input.bool(false, "Alarm bei jedem Sweep", group = G_ALR)
+bool alertSetup = input.bool(true, "Alarm wenn ein Setup scharf ist (Limit-Order)", group = G_ALR)
+bool alertTrade = input.bool(true, "Alarm bei Einstieg und Ausstieg", group = G_ALR)
+bool jsonMsg    = input.bool(false, "Nachricht als JSON (für Webhooks)", group = G_ALR)
+
+// ───────────────────────────── Farben
+color C_GOLD = #e3b341
+color C_POOL = #4c8dff
+color C_UP   = #2fbf71
+color C_DN   = #e5534b
+color C_DIM  = #8a8d93
+color C_FVG  = #9b6bff
+color C_NONE = color.new(color.black, 100)
+
+// ───────────────────────────── Typen
+type Pool
+    float  level
+    string side
+    string tag
+    int    born
+    line   ln
+    label  lbl
+
+type Zone
+    int   dir
+    float top
+    float bot
+    int   born
+    bool  touched = false
+    box   bx
+
+// ───────────────────────────── Hilfsfunktionen
+// Pivot bei bar_index - k: links strikt höher, rechts höher-oder-gleich (wie in Python)
+f_pivotHigh(int k) =>
+    float p = high[k]
+    bool ok = true
+    for j = 1 to k
+        if high[k + j] >= p or high[k - j] > p
+            ok := false
+    ok
+
+f_pivotLow(int k) =>
+    float p = low[k]
+    bool ok = true
+    for j = 1 to k
+        if low[k + j] <= p or low[k - j] < p
+            ok := false
+    ok
+
+// höchstes Hoch / tiefstes Tief zwischen zwei bar_index-Werten (inklusive)
+f_maxHigh(int a, int b) =>
+    float m = 0.0
+    if b >= a
+        for j = a to b
+            m := math.max(m, high[bar_index - j])
+    m
+
+f_minLow(int a, int b) =>
+    float m = 1.0e100
+    if b >= a
+        for j = a to b
+            m := math.min(m, low[bar_index - j])
+    m
+
+f_hasPool(array<Pool> ps, string side, float lvl, float tol) =>
+    bool found = false
+    for pl in ps
+        if pl.side == side and math.abs(pl.level - lvl) <= tol
+            found := true
+    found
+
+f_newPool(float lvl, string side, string tag, int x1) =>
+    line ln = na
+    label lbl = na
+    if showPools
+        ln := line.new(x1, lvl, bar_index, lvl, color = C_POOL, width = 1)
+        lbl := label.new(bar_index, lvl, tag + " " + side, style = label.style_label_left, color = C_NONE, textcolor = C_POOL, size = size.tiny)
+    Pool.new(lvl, side, tag, bar_index, ln, lbl)
+
+f_newZone(int dir, float top, float bot, int x1, string txt, color col, bool show) =>
+    box bx = na
+    if show
+        bx := box.new(x1, top, bar_index, bot, border_color = color.new(col, 55), bgcolor = color.new(col, 85), text = txt, text_size = size.tiny, text_color = color.new(col, 20), text_halign = text.align_left, text_valign = text.align_top)
+    Zone.new(dir, top, bot, bar_index, false, bx)
+
+f_hm(string s) =>
+    array<string> parts = str.split(s, ":")
+    int(str.tonumber(parts.get(0))) * 60 + int(str.tonumber(parts.get(1)))
+
+f_px(float x) =>
+    str.tostring(x, format.mintick)
+
+f_r(float x) =>
+    (x >= 0 ? "+" : "") + str.tostring(x, "0.00") + "R"
+
+f_num(float x) =>
+    na(x) ? "null" : str.tostring(x)
+
+f_refuse(map<string, int> m, string reason) =>
+    m.put(reason, nz(m.get(reason)) + 1)
+    if showRefuse
+        label.new(bar_index, high, "×", style = label.style_label_down, color = C_NONE, textcolor = C_DIM, size = size.small, tooltip = "abgelehnt: " + reason)
+
+f_msg(string event, string text, int dir, float price, float sl, float tp) =>
+    string side = dir == 1 ? "buy" : "sell"
+    jsonMsg ? '{"bot":"ADF","event":"' + event + '","ticker":"' + syminfo.ticker + '","side":"' + side + '","price":' + f_num(price) + ',"sl":' + f_num(sl) + ',"tp":' + f_num(tp) + '}' : "ADF " + syminfo.ticker + " · " + text
+
+// Richtung des letzten Strukturbruchs (für den höheren Timeframe)
+f_structDir(int k) =>
+    var float sh = na
+    var float sl = na
+    var bool shDone = true
+    var bool slDone = true
+    var int dir = 0
+    if bar_index >= 2 * k
+        if f_pivotHigh(k)
+            sh := high[k]
+            shDone := false
+        if f_pivotLow(k)
+            sl := low[k]
+            slDone := false
+    if not shDone and close > sh
+        shDone := true
+        dir := 1
+    if not slDone and close < sl
+        slDone := true
+        dir := -1
+    dir
+
+// ───────────────────────────── Grundwerte je Kerze
+float atr      = ta.atr(14)
+float volRatio = volume / math.max(1.0, ta.sma(volume, 21))
+int   poolAge  = math.round(2 * 390 * 60 / timeframe.in_seconds())
+int   nyMin    = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+bool  newDay   = session.isfirstbar_regular
+bool  lastBar  = session.islastbar_regular
+int   startMin = f_hm(tStart)
+int   endMin   = f_hm(tEnd)
+
+// HTF-Trend der letzten abgeschlossenen HTF-Kerze (lookahead_on + [1] = kein Repainting)
+int htfRaw = request.security(syminfo.tickerid, htfTf, f_structDir(swingK)[1], lookahead = barmerge.lookahead_on)
+int htfDir = useBias ? nz(htfRaw) : 0
+
+// ───────────────────────────── Zustand der Erkennung
+var array<Pool>  pools    = array.new<Pool>()
+var array<Zone>  fvgs     = array.new<Zone>()
+var array<Zone>  obs      = array.new<Zone>()
+var array<int>   shBars   = array.new<int>()
+var array<float> shPrices = array.new<float>()
+var array<int>   slBars   = array.new<int>()
+var array<float> slPrices = array.new<float>()
+var float lastSH    = na
+var int   lastSHBar = na
+var bool  shBroken  = true
+var float lastSL    = na
+var int   lastSLBar = na
+var bool  slBroken  = true
+var int   trend     = 0
+var float dayHi     = na
+var float dayLo     = na
+var int   lastBullFvgBar = na
+var float lastBullFvgTop = na
+var float lastBullFvgBot = na
+var int   lastBearFvgBar = na
+var float lastBearFvgTop = na
+var float lastBearFvgBot = na
+
+// Events dieser Kerze (für die Engine)
+int    sweepCount = 0
+int    sweepDir   = 0
+float  sweepX     = na
+float  sweepLvl   = na
+string sweepTag   = ""
+bool   brkBull    = false
+bool   brkBear    = false
+string brkKind    = ""
+float  brkLvl     = na
+float  obBullTop  = na
+float  obBullBot  = na
+float  obBearTop  = na
+float  obBearBot  = na
+
+// 1) neue Session: Vortageshoch/-tief werden zu Pools
+if newDay
+    if usePdhl and not na(dayHi)
+        pools.push(f_newPool(dayHi, "BSL", "PDH", bar_index))
+        pools.push(f_newPool(dayLo, "SSL", "PDL", bar_index))
+    dayHi := high
+    dayLo := low
+else if session.ismarket
+    dayHi := na(dayHi) ? high : math.max(dayHi, high)
+    dayLo := na(dayLo) ? low : math.min(dayLo, low)
+
+// 2) Pools: Sweep (Docht durch, Schluss zurück) oder durchbrochen
+if pools.size() > 0
+    for idx = pools.size() - 1 to 0
+        Pool pl = pools.get(idx)
+        bool isBSL = pl.side == "BSL"
+        bool hit = isBSL ? high > pl.level : low < pl.level
+        if hit
+            bool back = isBSL ? close < pl.level : close > pl.level
+            if not na(pl.ln)
+                pl.ln.set_x2(bar_index)
+                pl.ln.set_color(back ? C_GOLD : C_DIM)
+                pl.lbl.set_x(bar_index)
+            if back
+                // neuester Pool zuerst - er gewinnt, wenn mehrere in einer Kerze gesweept werden
+                if sweepCount == 0
+                    sweepDir := isBSL ? -1 : 1
+                    sweepX   := isBSL ? high : low
+                    sweepLvl := pl.level
+                    sweepTag := pl.tag
+                sweepCount += 1
+            pools.remove(idx)
+        else if bar_index - pl.born > poolAge
+            if not na(pl.ln)
+                pl.ln.set_style(line.style_dashed)
+            pools.remove(idx)
+        else if not na(pl.ln)
+            pl.ln.set_x2(bar_index)
+            pl.lbl.set_x(bar_index)
+
+if sweepCount > 0 and showSweeps
+    label.new(bar_index, sweepDir == -1 ? high : low, "Sweep " + sweepTag, style = sweepDir == -1 ? label.style_label_down : label.style_label_up, color = C_NONE, textcolor = C_GOLD, size = size.tiny)
+
+// 3) Fair Value Gaps: angelaufen / invertiert / abgelaufen
+if fvgs.size() > 0
+    for idx = fvgs.size() - 1 to 0
+        Zone z = fvgs.get(idx)
+        bool tapped = z.dir == 1 ? low <= z.top : high >= z.bot
+        bool broken = z.dir == 1 ? close < z.bot : close > z.top
+        if broken
+            if not na(z.bx)
+                z.bx.set_right(bar_index)
+                z.bx.set_bgcolor(color.new(C_DIM, 92))
+            fvgs.remove(idx)
+        else
+            if tapped and not z.touched
+                z.touched := true
+            if bar_index - z.born > fvgAge
+                fvgs.remove(idx)
+            else if not na(z.bx)
+                z.bx.set_right(bar_index)
+
+// 4) Order Blocks: angelaufen / ungültig / abgelaufen
+if obs.size() > 0
+    for idx = obs.size() - 1 to 0
+        Zone z = obs.get(idx)
+        bool touched = z.dir == 1 ? low <= z.top : high >= z.bot
+        bool broken  = z.dir == 1 ? close < z.bot : close > z.top
+        if broken
+            if not na(z.bx)
+                z.bx.set_right(bar_index)
+                z.bx.set_bgcolor(color.new(C_DIM, 92))
+            obs.remove(idx)
+        else
+            if touched and not z.touched
+                z.touched := true
+            if bar_index - z.born > obAge
+                obs.remove(idx)
+            else if not na(z.bx)
+                z.bx.set_right(bar_index)
+
+// 5) Swings bestätigen (+ gleiche Hochs/Tiefs als Pools)
+if bar_index >= 2 * swingK
+    if f_pivotHigh(swingK)
+        int   p  = bar_index - swingK
+        float ph = high[swingK]
+        string tag = shPrices.size() == 0 ? "H" : ph > shPrices.last() ? "HH" : "LH"
+        if showSwings
+            label.new(p, ph, tag, style = label.style_label_down, color = C_NONE, textcolor = tag == "HH" ? C_UP : tag == "LH" ? C_DN : C_DIM, size = size.tiny)
+        if shBars.size() > 0
+            for q = shBars.size() - 1 to 0
+                int   qb = shBars.get(q)
+                float qp = shPrices.get(q)
+                if p - qb > eqLook
+                    break
+                if math.abs(qp - ph) <= eqTol * atr and f_maxHigh(qb + 1, p - 1) <= math.max(qp, ph)
+                    float lvl = math.max(qp, ph)
+                    if not f_hasPool(pools, "BSL", lvl, eqTol * atr)
+                        pools.push(f_newPool(lvl, "BSL", "EQH", qb))
+                    break
+        shBars.push(p)
+        shPrices.push(ph)
+        if shBars.size() > 100
+            shBars.shift()
+            shPrices.shift()
+        lastSH    := ph
+        lastSHBar := p
+        shBroken  := false
+    if f_pivotLow(swingK)
+        int   p  = bar_index - swingK
+        float pLo = low[swingK]
+        string tag = slPrices.size() == 0 ? "L" : pLo < slPrices.last() ? "LL" : "HL"
+        if showSwings
+            label.new(p, pLo, tag, style = label.style_label_up, color = C_NONE, textcolor = tag == "HL" ? C_UP : tag == "LL" ? C_DN : C_DIM, size = size.tiny)
+        if slBars.size() > 0
+            for q = slBars.size() - 1 to 0
+                int   qb = slBars.get(q)
+                float qp = slPrices.get(q)
+                if p - qb > eqLook
+                    break
+                if math.abs(qp - pLo) <= eqTol * atr and f_minLow(qb + 1, p - 1) >= math.min(qp, pLo)
+                    float lvl = math.min(qp, pLo)
+                    if not f_hasPool(pools, "SSL", lvl, eqTol * atr)
+                        pools.push(f_newPool(lvl, "SSL", "EQL", qb))
+                    break
+        slBars.push(p)
+        slPrices.push(pLo)
+        if slBars.size() > 100
+            slBars.shift()
+            slPrices.shift()
+        lastSL    := pLo
+        lastSLBar := p
+        slBroken  := false
+
+// 6) Strukturbrüche (+ Order Block des brechenden Beins)
+if not na(lastSH) and not shBroken and close > lastSH
+    shBroken := true
+    brkKind  := trend == -1 ? "MSS" : "BOS"
+    trend    := 1
+    brkBull  := true
+    brkLvl   := lastSH
+    if showBreaks
+        line.new(lastSHBar, lastSH, bar_index, lastSH, color = brkKind == "MSS" ? C_DN : C_DIM, style = line.style_dashed)
+        label.new(bar_index, lastSH, brkKind, style = label.style_label_down, color = C_NONE, textcolor = brkKind == "MSS" ? C_DN : C_DIM, size = size.tiny)
+    int loJ   = not na(lastSLBar) and lastSLBar < bar_index ? lastSLBar : math.max(0, bar_index - 20)
+    int stopJ = math.max(loJ, bar_index - 30)
+    if stopJ <= bar_index - 1
+        for j = bar_index - 1 to stopJ
+            int off = bar_index - j
+            if close[off] < open[off]
+                obs.push(f_newZone(1, high[off], low[off], j, "OB", C_UP, showOb))
+                obBullTop := high[off]
+                obBullBot := low[off]
+                break
+
+if not na(lastSL) and not slBroken and close < lastSL
+    slBroken := true
+    brkKind  := trend == 1 ? "MSS" : "BOS"
+    trend    := -1
+    brkBear  := true
+    brkLvl   := lastSL
+    if showBreaks
+        line.new(lastSLBar, lastSL, bar_index, lastSL, color = brkKind == "MSS" ? C_DN : C_DIM, style = line.style_dashed)
+        label.new(bar_index, lastSL, brkKind, style = label.style_label_up, color = C_NONE, textcolor = brkKind == "MSS" ? C_DN : C_DIM, size = size.tiny)
+    int loJ   = not na(lastSHBar) and lastSHBar < bar_index ? lastSHBar : math.max(0, bar_index - 20)
+    int stopJ = math.max(loJ, bar_index - 30)
+    if stopJ <= bar_index - 1
+        for j = bar_index - 1 to stopJ
+            int off = bar_index - j
+            if close[off] > open[off]
+                obs.push(f_newZone(-1, high[off], low[off], j, "OB", C_DN, showOb))
+                obBearTop := high[off]
+                obBearBot := low[off]
+                break
+
+// 7) neue Fair Value Gaps (Kerzen bar_index-2 .. bar_index)
+if bar_index >= 2
+    if low > high[2] and low - high[2] >= fvgMin * atr
+        fvgs.push(f_newZone(1, low, high[2], bar_index - 2, "FVG", C_FVG, showFvg))
+        lastBullFvgBar := bar_index
+        lastBullFvgTop := low
+        lastBullFvgBot := high[2]
+    else if high < low[2] and low[2] - high >= fvgMin * atr
+        fvgs.push(f_newZone(-1, low[2], high, bar_index - 2, "FVG", C_DN, showFvg))
+        lastBearFvgBar := bar_index
+        lastBearFvgTop := low[2]
+        lastBearFvgBot := high
+
+if pools.size() > 200
+    pools.shift()
+if fvgs.size() > 200
+    fvgs.shift()
+if obs.size() > 200
+    obs.shift()
+
+// ───────────────────────────── Engine
+var int    candDir  = 0       // 1 = Long-Kandidat (SSL gesweept), -1 = Short-Kandidat (BSL gesweept)
+var int    candBar  = na
+var float  candX    = na
+var float  candLvl  = na
+var string candTag  = ""
+var int    ordDir   = 0
+var string ordId    = ""
+var float  ordEntry = na
+var float  ordSL    = na
+var float  ordTP    = na
+var int    ordExpire = na
+var int    ordClosedBase = 0
+var int    posDir   = 0
+var float  posEntry = na
+var float  posRisk  = na
+var float  posSL    = na
+var float  posTP    = na
+var int    tradeSeq = 0
+var int    tradesToday = 0
+var int    seenClosed = 0
+var float  sumNetR  = 0.0
+var map<string, int>   refusals = map.new<string, int>()
+var map<string, float> riskById = map.new<string, float>()
+
+if newDay
+    tradesToday := 0
+
+// a) wartende Limit-Order: gefüllt, ohne Retest weggelaufen oder abgelaufen
+if ordDir != 0
+    bool filled = strategy.position_size != 0 or strategy.closedtrades > ordClosedBase
+    if filled
+        tradesToday += 1
+        posDir   := strategy.position_size != 0 ? ordDir : 0
+        posEntry := ordEntry
+        posRisk  := math.abs(ordSL - ordEntry)
+        posSL    := ordSL
+        posTP    := ordTP
+        if alertTrade
+            alert(f_msg("fill", (ordDir == 1 ? "LONG" : "SHORT") + " Einstieg @ " + f_px(ordEntry) + " · SL " + f_px(ordSL) + " · TP " + f_px(ordTP), ordDir, ordEntry, ordSL, ordTP), alert.freq_once_per_bar_close)
+        ordDir := 0
+    else
+        bool ranAway = ordDir == 1 ? high >= ordTP : low <= ordTP
+        if ranAway or bar_index >= ordExpire or lastBar
+            strategy.cancel(ordId)
+            strategy.cancel("X" + ordId)
+            f_refuse(refusals, ranAway ? "lief_ohne_retest" : lastBar ? "sessionende" : "kein_retest")
+            ordDir := 0
+
+// b) abgeschlossene Trades auswerten (Stop/Ziel werden vom Broker-Emulator ausgeführt)
+if strategy.closedtrades > seenClosed
+    for n = seenClosed to strategy.closedtrades - 1
+        string eid  = strategy.closedtrades.entry_id(n)
+        float  risk = riskById.get(eid)
+        float  qty  = math.abs(strategy.closedtrades.size(n))
+        int    sgn  = strategy.closedtrades.size(n) > 0 ? 1 : -1
+        float  ep   = strategy.closedtrades.entry_price(n)
+        float  xp   = strategy.closedtrades.exit_price(n)
+        if not na(risk) and risk > 0 and qty > 0
+            float netR = strategy.closedtrades.profit(n) / (risk * qty)
+            sumNetR += netR
+            // EOD-Schlüsse wurden schon beim Schließen gemeldet
+            if alertTrade and strategy.closedtrades.exit_bar_index(n) == bar_index
+                float grossR = (xp - ep) * sgn / risk
+                alert(f_msg("exit", (sgn == 1 ? "LONG" : "SHORT") + " geschlossen @ " + f_px(xp) + " · " + f_r(grossR) + " (netto " + f_r(netR) + ")", sgn, xp, na, na), alert.freq_once_per_bar_close)
+    seenClosed := strategy.closedtrades
+if strategy.position_size == 0
+    posDir := 0
+
+// c) Schluss der Session: alles glattstellen
+if lastBar and strategy.position_size != 0
+    strategy.close_all(comment = "Schluss", immediately = true)
+    if alertTrade and posDir != 0 and posRisk > 0
+        float r = (close - posEntry) * posDir / posRisk
+        alert(f_msg("exit", (posDir == 1 ? "LONG" : "SHORT") + " zum Schluss geschlossen @ " + f_px(close) + " · " + f_r(r) + " brutto", posDir, close, na, na), alert.freq_once_per_bar_close)
+    posDir := 0
+
+// d) wartender Kandidat: Strukturbruch in Gegenrichtung macht das Setup scharf
+if candDir != 0
+    bool confirmed = candDir == 1 ? brkBull : brkBear
+    if confirmed
+        string zKind = ""
+        float  zTop  = na
+        float  zBot  = na
+        if candDir == 1
+            if not na(lastBullFvgBar) and lastBullFvgBar >= candBar
+                zKind := "FVG"
+                zTop  := lastBullFvgTop
+                zBot  := lastBullFvgBot
+            else if not na(obBullTop)
+                zKind := "OB"
+                zTop  := obBullTop
+                zBot  := obBullBot
+        else
+            if not na(lastBearFvgBar) and lastBearFvgBar >= candBar
+                zKind := "FVG"
+                zTop  := lastBearFvgTop
+                zBot  := lastBearFvgBot
+            else if not na(obBearTop)
+                zKind := "OB"
+                zTop  := obBearTop
+                zBot  := obBearBot
+        string reason = ""
+        float  entry  = na
+        float  sl     = na
+        float  risk   = na
+        if zKind == ""
+            reason := "keine_zone"
+        else if ordDir != 0 or strategy.position_size != 0
+            reason := "position_offen"
+        else if tradesToday >= maxTrades
+            reason := "tageslimit"
+        else if nyMin < startMin or nyMin > endMin
+            reason := "zeitfenster"
+        else if useBias and htfDir == -candDir
+            reason := "gegen_htf_trend"
+        else
+            entry := candDir == -1 ? zBot : zTop
+            sl    := candDir == -1 ? candX + slBuf * atr : candX - slBuf * atr
+            risk  := math.abs(sl - entry)
+            if candDir == -1 ? close >= entry : close <= entry
+                reason := "zone_schon_erreicht"
+            else if candDir == -1 ? sl <= entry : sl >= entry
+                reason := "stop_ungueltig"
+            else if risk < minRisk * atr
+                reason := "risiko_zu_klein"
+            else if risk > maxRisk * atr
+                reason := "risiko_zu_gross"
+        if reason != ""
+            f_refuse(refusals, reason)
+        else
+            float tp  = candDir == -1 ? entry - rr * risk : entry + rr * risk
+            float qty = math.floor(strategy.equity * riskPct / 100 / risk)
+            qty := math.max(1, math.min(qty, math.floor(strategy.equity / entry)))
+            tradeSeq += 1
+            ordId := (candDir == 1 ? "L" : "S") + str.tostring(tradeSeq)
+            string dirTxt = candDir == 1 ? "LONG" : "SHORT"
+            string setupTxt = dirTxt + "-Setup: Sweep " + candTag + " " + f_px(candLvl) + " → " + brkKind + " " + f_px(brkLvl) + " → " + zKind + " · Limit " + f_px(entry) + " · SL " + f_px(sl) + " · TP " + f_px(tp)
+            strategy.entry(ordId, candDir == 1 ? strategy.long : strategy.short, qty = qty, limit = entry, comment = dirTxt + " " + zKind)
+            strategy.exit("X" + ordId, from_entry = ordId, stop = sl, limit = tp, comment_loss = "Stop", comment_profit = "Ziel")
+            riskById.put(ordId, risk)
+            ordDir    := candDir
+            ordEntry  := entry
+            ordSL     := sl
+            ordTP     := tp
+            ordExpire := bar_index + entryWin
+            ordClosedBase := strategy.closedtrades
+            label.new(bar_index, candDir == 1 ? low : high, "★ " + dirTxt + "\nLimit " + f_px(entry), style = candDir == 1 ? label.style_label_up : label.style_label_down, color = color.new(C_GOLD, 15), textcolor = color.black, size = size.small, tooltip = setupTxt)
+            if alertSetup
+                alert(f_msg("setup", setupTxt, candDir, entry, sl, tp), alert.freq_once_per_bar_close)
+        candDir := 0
+    else if bar_index - candBar >= mssWin or lastBar
+        f_refuse(refusals, "kein_mss")
+        candDir := 0
+
+// e) neuer Sweep startet einen neuen Kandidaten
+if sweepCount > 0 and session.ismarket
+    if candDir != 0
+        f_refuse(refusals, "ersetzt")
+    if sweepCount > 1
+        for extra = 2 to sweepCount
+            f_refuse(refusals, "ersetzt")
+    candDir := sweepDir
+    candBar := bar_index
+    candX   := sweepX
+    candLvl := sweepLvl
+    candTag := sweepTag
+    if alertSweep
+        alert(f_msg("sweep", "Sweep " + sweepTag + " " + f_px(sweepLvl) + " (Docht " + f_px(sweepX) + ", Vol " + str.tostring(volRatio, "0.0") + "x) – warte auf MSS", sweepDir, close, na, na), alert.freq_once_per_bar_close)
+
+// ───────────────────────────── Linien für offene Order / Position
+plot(ordDir != 0 ? ordEntry : na, "Limit", color = C_GOLD, style = plot.style_linebr, linewidth = 2)
+plot(posDir != 0 ? posSL : na, "Stop", color = C_DN, style = plot.style_linebr)
+plot(posDir != 0 ? posTP : na, "Ziel", color = C_UP, style = plot.style_linebr)
+
+// ───────────────────────────── Farm-Tabelle
+var table tbl = table.new(position.top_right, 2, 10, bgcolor = color.new(#131417, 5), border_color = #26282d, border_width = 1)
+if showTable and barstate.islast
+    string status = strategy.position_size != 0 ? "im Trade" : ordDir != 0 ? "Limit aktiv @ " + f_px(ordEntry) : candDir != 0 ? "Sweep – warte auf MSS" : "beobachte"
+    int    closed = strategy.closedtrades
+    string winTxt = closed > 0 ? str.tostring(100.0 * strategy.wintrades / closed, "0") + " %" : "–"
+    string pfTxt  = strategy.grossloss > 0 ? str.tostring(strategy.grossprofit / strategy.grossloss, "0.00") : "–"
+    int    nRef   = 0
+    string topRef = "–"
+    int    topN   = 0
+    for [k, v] in refusals
+        nRef += v
+        if v > topN
+            topN   := v
+            topRef := k
+    table.cell(tbl, 0, 0, "AKTIEN DATA FARM", text_color = C_GOLD, text_size = size.small)
+    table.cell(tbl, 1, 0, syminfo.ticker + " · " + timeframe.period, text_color = C_DIM, text_size = size.small)
+    table.cell(tbl, 0, 1, "Status", text_color = C_DIM, text_size = size.small)
+    table.cell(tbl, 1, 1, status, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 2, "HTF-Trend", text_color = C_DIM, text_size = size.small)
+    table.cell(tbl, 1, 2, htfDir == 1 ? "aufwärts" : htfDir == -1 ? "abwärts" : "–", text_color = htfDir == 1 ? C_UP : htfDir == -1 ? C_DN : C_DIM, text_size = size.small)
+    table.cell(tbl, 0, 3, "Aktive Pools", text_color = C_DIM, text_size = size.small)
+    table.cell(tbl, 1, 3, str.tostring(pools.size()), text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 4, "Trades heute", text_color = C_DIM, text_size = size.small)
+    table.cell(tbl, 1, 4, str.tostring(tradesToday) + " / " + str.tostring(maxTrades), text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 5, "Trades gesamt", text_color = C_DIM, text_size = size.small)
+    table.cell(tbl, 1, 5, str.tostring(closed), text_color = C_GOLD, text_size = size.small)
+    table.cell(tbl, 0, 6, "Trefferquote", text_color = C_DIM, text_size = size.small)
+    table.cell(tbl, 1, 6, winTxt, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 7, "Netto (R)", text_color = C_DIM, text_size = size.small)
+    table.cell(tbl, 1, 7, f_r(sumNetR), text_color = sumNetR >= 0 ? C_UP : C_DN, text_size = size.small)
+    table.cell(tbl, 0, 8, "Profit-Faktor", text_color = C_DIM, text_size = size.small)
+    table.cell(tbl, 1, 8, pfTxt, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 9, "Abgelehnt", text_color = C_DIM, text_size = size.small)
+    table.cell(tbl, 1, 9, str.tostring(nRef) + (nRef > 0 ? " (meist: " + topRef + ")" : ""), text_color = C_DIM, text_size = size.small)
