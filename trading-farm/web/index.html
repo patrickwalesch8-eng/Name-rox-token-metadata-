@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aktien Data Farm</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">AKTIEN <span>\</span> DATA FARM</div>
+  <nav id="tabs">
+    <a data-tab="overview">Übersicht</a>
+    <a data-tab="chart">Chart</a>
+    <a data-tab="studies">Studien</a>
+    <a data-tab="events">Events</a>
+  </nav>
+  <div class="status" id="status"></div>
+</header>
+<div id="demo-banner" class="banner" hidden>DEMO-DATEN – synthetische Kurse, keine echten Ergebnisse. Am PC <code>python farm.py all</code> ausführen für echte Daten.</div>
+<main id="view"></main>
+<div id="nodata" class="nodata" hidden>
+  <h2>Noch keine Daten</h2>
+  <p>Im Ordner <code>trading-farm</code> zuerst <code>python farm.py run</code> (echte Daten) oder <code>python farm.py demo</code> ausführen.</p>
+</div>
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

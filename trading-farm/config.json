@@ -1,0 +1,29 @@
+{
+  "symbols": ["SPY", "QQQ", "AAPL", "NVDA", "TSLA"],
+  "timeframes": ["5m", "15m", "1h"],
+  "detect": {
+    "swing_k": 2,
+    "eq_tol_atr": 0.1,
+    "eq_lookback": 60,
+    "fvg_min_atr": 0.25,
+    "fvg_max_age": 60,
+    "ob_max_age": 120,
+    "pdh_pdl_pools": true
+  },
+  "engine": {
+    "mss_window": 12,
+    "entry_window": 12,
+    "target_rr": 2.0,
+    "sl_buffer_atr": 0.1,
+    "min_risk_atr": 0.3,
+    "max_risk_atr": 3.0,
+    "no_entry_before": "09:45",
+    "no_entry_after": "15:30",
+    "max_trades_per_day": 2,
+    "use_htf_bias": true
+  },
+  "costs": {
+    "slippage_bps": 2,
+    "commission_per_share": 0.0
+  }
+}

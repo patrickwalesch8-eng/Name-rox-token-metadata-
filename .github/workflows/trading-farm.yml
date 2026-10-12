@@ -1,0 +1,57 @@
+# Aktien Data Farm: laedt nach US-Boersenschluss neue Daten, baut das Dashboard
+# und veroeffentlicht es auf GitHub Pages (damit es auch am Handy erreichbar ist).
+name: Trading Farm
+
+on:
+  schedule:
+    - cron: "30 21 * * 1-5"   # Mo-Fr 21:30 UTC, nach dem US-Schluss
+  workflow_dispatch:          # manuell starten: Actions -> Trading Farm -> Run workflow
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: trading-farm
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: trading-farm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests
+      - name: Daten laden
+        continue-on-error: true   # Yahoo blockiert manchmal - dann mit den gespeicherten Daten weiter
+        run: python farm.py fetch
+      - name: Analysieren und Dashboard bauen
+        run: |
+          if ls data/raw/*.csv >/dev/null 2>&1; then python farm.py run; else python farm.py demo; fi
+      - name: Daten-Historie sichern
+        run: |
+          git config user.name "trading-farm-bot"
+          git config user.email "trading-farm-bot@users.noreply.github.com"
+          git add data/raw
+          git diff --cached --quiet || (git commit -m "farm: Daten $(date -u +%F)" && git push)
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: trading-farm/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
