@@ -483,13 +483,25 @@ if newDay
     tradesToday := 0
     // Sicherheitsnetz: falls die Schluss-Kerze nie kam (dünner Handel, Halbtag)
     if strategy.position_size != 0 or ordDir != 0
-        bool hadPos = strategy.position_size != 0
+        // Seite und Id aus dem Strategie-Zustand lesen, bevor geschlossen wird
+        bool   hadPos    = strategy.position_size != 0
+        bool   ordFilled = ordDir != 0 and (hadPos or strategy.closedtrades > ordClosedBase)
+        int    fsDir     = strategy.position_size > 0 ? 1 : -1
+        string fsId      = ""
+        if hadPos
+            fsId := strategy.opentrades.entry_id(0)
         strategy.cancel_all()
         strategy.close_all(comment = "Failsafe", immediately = true)
-        if ordDir != 0
+        if ordDir != 0 and not ordFilled
             f_refuse(refusals, "sessionende")
+            if alertSetup
+                alert(f_msg("cancel", (ordDir == 1 ? "LONG" : "SHORT") + " Limit " + f_px(ordEntry) + " streichen (sessionende)", ordDir, ordEntry, na, na, ordId), alert.freq_once_per_bar_close)
+        if ordFilled
+            tradesToday += 1
+            if alertTrade and hadPos
+                alert(f_msg("fill", (ordDir == 1 ? "LONG" : "SHORT") + " Einstieg @ " + f_px(ordEntry) + " (Order von gestern)", ordDir, ordEntry, ordSL, ordTP, ordId), alert.freq_once_per_bar_close)
         if alertTrade and hadPos
-            alert(f_msg("exit", "Position über Nacht gefunden – glattgestellt @ " + f_px(close), posDir, close, na, na), alert.freq_once_per_bar_close)
+            alert(f_msg("exit", "Position über Nacht gefunden – glattgestellt @ " + f_px(close), fsDir, close, na, na, fsId), alert.freq_once_per_bar_close)
         ordDir := 0
         posDir := 0
     if candDir != 0
