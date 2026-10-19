@@ -297,9 +297,11 @@ class SmcBot:
         expected = self.srv.offset_at(now)
         if measured != expected:
             state = "tz"
+            # eine falsche Windows-Zeitzone sieht genauso aus wie eine falsche Regel -> PC zuerst prüfen
             msg = (f"Broker-Serverzeit ist UTC{measured / 3600:+.1f} h, nach SERVER_TZ = '{self.srv.rule}' "
-                   f"wären es UTC{expected / 3600:+.1f} h. Bitte SERVER_TZ in mt5_config.py anpassen "
-                   f"(oder geht die PC-Uhr falsch?) - bis dahin keine neuen Orders.")
+                   f"wären es UTC{expected / 3600:+.1f} h - bis dahin keine neuen Orders. Zuerst prüfen: "
+                   f"Ist es in New York gerade {ny_ts(now):%H:%M} Uhr? Wenn nicht, stimmt die Windows-Uhr "
+                   f"oder ihre Zeitzone nicht. Wenn ja, SERVER_TZ in mt5_config.py anpassen.")
         else:
             skew = diff - expected
             self.skew = skew if abs(skew) > MAX_CLOCK_SKEW else 0

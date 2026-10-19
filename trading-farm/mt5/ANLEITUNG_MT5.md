@@ -21,8 +21,9 @@ Das Sicherheitskonzept stammt von deinem Trend-Bot und wurde erweitert.
    Broker laufen auf „New York + 7 Stunden“, das ist in `mt5_config.py` als `SERVER_TZ = "NY+7"`
    voreingestellt. Der Bot prüft das an den Live-Kursen, sobald neue Kurse hereinkommen. Passt
    es nicht, steht im Fenster zum Beispiel „Broker-Serverzeit ist UTC+2.0 h …“, und er
-   platziert keine Orders.
-   Dann `SERVER_TZ` anpassen:
+   platziert keine Orders. Prüfe dann **zuerst die Windows-Uhr**: Die Meldung nennt die
+   New-York-Zeit, die der PC errechnet. Stimmt die nicht (z.B. mit time.is vergleichen), ist die
+   Uhr oder die Zeitzone in Windows falsch eingestellt. Stimmt sie, `SERVER_TZ` anpassen:
    - `"Europe/Athens"` für GMT+2/+3 mit europäischer Umstellung
    - `"UTC+2"` für eine feste Zeit ohne Umstellung
 
