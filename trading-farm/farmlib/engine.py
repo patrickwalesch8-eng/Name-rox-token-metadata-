@@ -34,8 +34,14 @@ def htf_bias_series(df5, htf_events, tf_minutes):
     return out
 
 
-def run_engine(df, events, atr_arr, sym, cfg, costs, bias=None):
-    """df: 5m bars (t,o,h,l,c,v,day,mins); events: detector events of that df."""
+def run_engine(df, events, atr_arr, sym, cfg, costs, bias=None, open_end=False, state_out=None):
+    """df: 5m bars (t,o,h,l,c,v,day,mins); events: detector events of that df.
+
+    open_end: the data ends at the newest *closed* bar of a running session (live
+              trading) - the final bar is then not treated as the session's last bar.
+    state_out: optional dict that receives the engine state after the final bar
+               (pending "order", open "pos", waiting "cand") - used by the live bot.
+    """
     t = df.t.values
     o, h, l, c = (df[x].values.astype(float) for x in "ohlc")
     day, mins = df.day.values, df.mins.values
@@ -50,7 +56,7 @@ def run_engine(df, events, atr_arr, sym, cfg, costs, bias=None):
 
     trades, refusals = [], []
     base_fields_keys = ("dir", "sweep", "sweep_t", "sweep_lb", "sweep_p", "sweep_x", "sweep_vol")
-    st ={"cand": None, "order": None, "pos": None}
+    st = {"cand": None, "order": None, "pos": None}
     per_day = {}
 
     def refuse(reason, i, base, **kw):
@@ -59,7 +65,7 @@ def run_engine(df, events, atr_arr, sym, cfg, costs, bias=None):
             rec.update(base_fields(base))
         else:                                   # a pending order already carries the fields
             rec.update({key: base[key] for key in base_fields_keys})
-            rec.update({key: base[key] for key in ("mss", "mss_k", "mss_p", "mss_t", "entry", "sl", "tp")})
+            rec.update({key: base[key] for key in ("mss", "mss_k", "mss_p", "mss_t", "entry", "sl", "tp", "armed_t")})
         rec.update(kw)
         refusals.append(rec)
 
@@ -133,7 +139,8 @@ def run_engine(df, events, atr_arr, sym, cfg, costs, bias=None):
 
     for i in range(n):
         # session end: last bar of the day, or the bar that ends at/after flat_at
-        last_bar = i == n - 1 or day[i + 1] != day[i] or mins[i] + bar_min >= flat_m
+        last_bar = (i == n - 1 and not open_end) or (i < n - 1 and day[i + 1] != day[i]) \
+            or mins[i] + bar_min >= flat_m
 
         # 1) manage the open position (from the bar after the fill)
         pos = st["pos"]
@@ -193,6 +200,8 @@ def run_engine(df, events, atr_arr, sym, cfg, costs, bias=None):
                     refuse("ersetzt", i, st["cand"])
                 st["cand"] = {"dir": "short" if e["d"] == "bear" else "long", "sweep": e, "i": i}
 
+    if state_out is not None:
+        state_out.update(cand=st["cand"], order=st["order"], pos=st["pos"])
     for tr in trades:
         tr.pop("fill_i", None)
         tr.pop("expires", None)

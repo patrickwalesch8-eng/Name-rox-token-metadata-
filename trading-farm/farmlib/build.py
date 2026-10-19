@@ -6,8 +6,7 @@ from collections import Counter
 from pathlib import Path
 
 from . import data
-from .detect import detect
-from .engine import htf_bias_series, run_engine
+from .pipeline import analyze
 
 
 def clean(e):
@@ -50,24 +49,10 @@ def build(root, cfg, demo=False, log=print):
         syms.append(sym)
         df5 = data.add_session_cols(raw)
         day_of.update({(sym, int(t)): d for t, d in zip(df5.t.values, df5.day.values)})
-        out["bars"][sym] = {}
-        per_tf = {}
-        for tf in cfg["timeframes"]:
-            dft = data.aggregate(df5, tf)
-            ev, a = detect(dft, sym, tf, cfg["detect"])
-            per_tf[tf] = (dft, ev, a)
-            out["bars"][sym][tf] = [[int(r.t), round(r.o, 4), round(r.h, 4), round(r.l, 4), round(r.c, 4), int(r.v)]
-                                    for r in dft.itertuples()]
-        if "5m" in per_tf:
-            df_base, ev_base, a_base = per_tf["5m"]
-        else:
-            df_base = df5
-            ev_base, a_base = detect(df5, sym, "5m", cfg["detect"])
-        bias = None
-        htf = "1h" if "1h" in per_tf else None
-        if htf:
-            bias = htf_bias_series(df_base, per_tf[htf][1], data.TF_MIN[htf])
-        trades, refusals = run_engine(df_base, ev_base, a_base, sym, cfg["engine"], cfg["costs"], bias)
+        res = analyze(df5, sym, cfg)
+        per_tf, trades, refusals = res["per_tf"], res["trades"], res["refusals"]
+        out["bars"][sym] = {tf: [[int(r.t), round(r.o, 4), round(r.h, 4), round(r.l, 4), round(r.c, 4), int(r.v)]
+                                 for r in dft.itertuples()] for tf, (dft, _, _) in per_tf.items()}
         for tf, (_, ev, _) in per_tf.items():
             out["events"].extend(clean(e) for e in ev)
         out["trades"].extend(trades)
