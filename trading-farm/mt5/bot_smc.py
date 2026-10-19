@@ -18,7 +18,8 @@ Sicherheit (Konzept vom Trend-Bot übernommen und erweitert):
   - Limit-Orders verfallen beim Broker von selbst, auch wenn der Bot abstürzt
   - Lotgröße rechnet der Broker selbst (order_calc_profit), abgerundet, durch Margin begrenzt
   - max. eine Position/Order pro Aktie, MAX_OPEN_POSITIONS gesamt; nie Doppel-Orders
-  - Tagesverlust-Grenze, Spread-Filter, Uhrzeit-Prüfung, nur eine Instanz gleichzeitig
+  - Tagesverlust-Grenze, Spread-Filter, nur eine Instanz gleichzeitig
+  - Serverzeit-Regel und PC-Uhr werden an frischen Ticks geprüft; glattgestellt wird nach der Broker-Uhr
   - ein Fehler (z.B. Journal in Excel geöffnet) stoppt den Bot nicht
   - beim Start werden keine alten Signale nachgehandelt
 
@@ -60,6 +61,7 @@ RETRY_SAFE = (RET_REQUOTE, RET_PRICE_CHANGED, RET_PRICE_OFF, RET_TOO_MANY, RET_C
 # Bitfeld symbol_info.expiration_mode und Order-Zustände der Historie
 EXP_GTC, EXP_DAY, EXP_SPECIFIED = 1, 2, 4
 ORDER_STATE_CANCELED, ORDER_STATE_REJECTED, ORDER_STATE_EXPIRED = 2, 5, 6
+MAX_CLOCK_SKEW = 60   # so viele Sekunden darf die PC-Uhr von der Broker-Uhr abweichen
 
 
 def setup_logging():
@@ -132,6 +134,9 @@ class SmcBot:
         self.status: dict[str, str] = {}
         self.login = None
         self.clock_ok = None                    # None = noch nicht geprüft
+        self.clock_state = None                 # "ok" | "tz" | "pc" - nur bei Wechsel ins Log
+        self.skew = 0                           # Broker-Uhr minus PC-Uhr (Sekunden), siehe now()
+        self.last_tick = None                   # neuester Tick der letzten Uhrprüfung
         self.account_ok = True
         self.trading_ok = True
         self.known_positions: dict[int, dict] = {}
@@ -167,7 +172,7 @@ class SmcBot:
     def journal(self, row: dict):
         """Journal-Zeile schreiben. Ist die Datei gesperrt (z.B. in Excel geöffnet), wird die
         Zeile gemerkt und später nachgetragen - der Bot läuft weiter."""
-        row.setdefault("zeit_ny", ny_ts(self.clock()).strftime("%Y-%m-%d %H:%M:%S"))
+        row.setdefault("zeit_ny", ny_ts(self.now()).strftime("%Y-%m-%d %H:%M:%S"))
         self.journal_backlog.append(row)
         p = self.path(C.JOURNAL_FILE)
         try:
@@ -268,32 +273,45 @@ class SmcBot:
             sys.exit(1)
 
     # ------------------------------------------------------------------ Zeit & Daten
+    def now(self) -> float:
+        """Jetzt (UTC-Sekunden) nach der Broker-Uhr: PC-Uhr plus gemessene Abweichung."""
+        return self.clock() + self.skew
+
     def check_clock(self):
-        """Passt die gemessene Serverzeit (frischester Tick) zur Regel SERVER_TZ?
-        Wenn nicht, werden keine neuen Orders platziert (lieber nichts tun als falsch)."""
+        """Passt die Serverzeit zur Regel SERVER_TZ, und geht die PC-Uhr richtig? Gemessen wird nur
+        an einem Tick, der seit der letzten Prüfung neu ist - der ist höchstens Sekunden alt.
+        Passt etwas nicht, werden keine neuen Orders platziert (lieber nichts tun als falsch)."""
         newest = None
         for sym in list(self.symbols.values()) + list(C.CLOCK_SYMBOLS):
             tick = self.mt5.symbol_info_tick(sym)
             if tick is not None and tick.time and (newest is None or tick.time > newest):
                 newest = tick.time
-        if newest is None:
-            return
+        fresh = newest is not None and self.last_tick is not None and newest > self.last_tick
+        if newest is not None:
+            self.last_tick = newest
+        if not fresh:
+            return  # kein neuer Tick (Markt zu, Wochenende): alter Tick wäre keine sichere Messung
         now = self.clock()
         diff = newest - now
         measured = round(diff / 1800) * 1800
-        if abs(diff - measured) > 300 or abs(measured) > 14 * 3600:
-            return  # Tick zu alt für eine sichere Messung
         expected = self.srv.offset_at(now)
-        ok = measured == expected
-        if ok != self.clock_ok:
-            if ok:
-                log.info(f"Broker-Serverzeit geprüft: UTC{measured / 3600:+.1f} h passt zu SERVER_TZ = "
-                         f"'{self.srv.rule}'.")
-            else:
-                log.error(f"Broker-Serverzeit ist UTC{measured / 3600:+.1f} h, nach SERVER_TZ = '{self.srv.rule}' "
-                          f"wären es UTC{expected / 3600:+.1f} h. Bitte SERVER_TZ in mt5_config.py anpassen - "
-                          f"bis dahin keine neuen Orders.")
-        self.clock_ok = ok
+        if measured != expected:
+            state = "tz"
+            msg = (f"Broker-Serverzeit ist UTC{measured / 3600:+.1f} h, nach SERVER_TZ = '{self.srv.rule}' "
+                   f"wären es UTC{expected / 3600:+.1f} h. Bitte SERVER_TZ in mt5_config.py anpassen "
+                   f"(oder geht die PC-Uhr falsch?) - bis dahin keine neuen Orders.")
+        else:
+            skew = diff - expected
+            self.skew = skew if abs(skew) > MAX_CLOCK_SKEW else 0
+            state = "pc" if self.skew else "ok"
+            msg = (f"Broker-Serverzeit geprüft: UTC{measured / 3600:+.1f} h passt zu SERVER_TZ = "
+                   f"'{self.srv.rule}'." if not self.skew else
+                   f"Die PC-Uhr geht {abs(skew):.0f} s {'vor' if skew < 0 else 'nach'}. Bitte die Windows-Uhr "
+                   f"stellen (Einstellungen > Zeit und Sprache > Jetzt synchronisieren) - bis dahin keine "
+                   f"neuen Orders. Glattgestellt wird nach der Uhr des Brokers.")
+        if state != self.clock_state:
+            (log.info if state == "ok" else log.error)(msg)
+        self.clock_state, self.clock_ok = state, state == "ok"
 
     def get_bars(self, sym: str) -> pd.DataFrame | None:
         """Geschlossene 5m-Kerzen der regulären US-Handelszeit, Zeit in UTC-Sekunden.
@@ -316,7 +334,7 @@ class SmcBot:
             "l": rates["low"][keep].astype(float), "c": rates["close"][keep].astype(float),
             "v": rates["tick_volume"][keep].astype("int64"),
         })
-        df = df[df.t + 300 <= self.clock() + 120]    # Plausibilität gegen die PC-Uhr
+        df = df[df.t + 300 <= self.now() + 120]      # Plausibilität gegen die Uhr
         df = data.add_session_cols(df)
         df = df[(df.mins >= data.SESSION_OPEN_MIN) & (df.mins < data.SESSION_CLOSE_MIN)]
         df = df.drop_duplicates("t").sort_values("t").reset_index(drop=True)
@@ -458,7 +476,7 @@ class SmcBot:
         acc = self.mt5.account_info()
         if acc is None:
             return
-        today = ny_ts(self.clock()).strftime("%Y-%m-%d")
+        today = ny_ts(self.now()).strftime("%Y-%m-%d")
         if self.state["day"] != today:
             self.state.update(day=today, day_equity=acc.equity, kill=False)
             self.save_state()
@@ -475,18 +493,18 @@ class SmcBot:
         """Außerhalb von 09:30 bis zur Schluss-Kerze hält der Bot nichts - unabhängig davon, ob
         noch Kerzen kommen. Bis zum Börsenschluss wird bei jedem Durchlauf neu versucht,
         danach alle 5 Minuten."""
-        nyt = ny_ts(self.clock())
+        nyt = ny_ts(self.now())
         day, mins = nyt.strftime("%Y-%m-%d"), nyt.hour * 60 + nyt.minute
         weekday = nyt.weekday() < 5
         if weekday and data.SESSION_OPEN_MIN <= mins < self.flat_min(day):
             return
         in_window = weekday and self.flat_min(day) <= mins < self.close_min(day)
-        if not in_window and self.clock() - self.last_flat_try < 300:
+        if not in_window and self.now() - self.last_flat_try < 300:
             return
         pos, ords = self.my_positions(), self.my_orders()
         if pos is None or ords is None or (not pos and not ords):
             return
-        self.last_flat_try = self.clock()
+        self.last_flat_try = self.now()
         for o in ords:
             self.cancel_order(o, "Sessionende")
         for p in pos:
@@ -533,26 +551,43 @@ class SmcBot:
                 self.save_state()
                 self.journal_open(plan, pos.symbol, pos.volume, pos.price_open, pos.sl, pos.tp)
         for ticket in [t for t in self.known_positions if t not in current]:
-            self.pending_close[ticket] = [self.known_positions.pop(ticket), 0]
+            info = self.known_positions.pop(ticket)
+            if all(e[0]["plan_id"] != info["plan_id"] for e in self.pending_close.values()):
+                self.pending_close[ticket] = [info, 0]   # (reconcile_plans kann sie schon eingereiht haben)
 
     def process_pending_closes(self):
         """Die Broker-Historie ist manchmal erst Sekunden später da -> bis zu 10 Versuche."""
         for ticket, entry in list(self.pending_close.items()):
             entry[1] += 1
-            if self.journal_close(entry[0]) or entry[1] >= 10:
+            if self.journal_close(entry[0]):
                 del self.pending_close[ticket]
+            elif entry[1] >= 10:
+                del self.pending_close[ticket]
+                log.warning(f"{entry[0]['symbol']}: keine Abschlussdaten für Position {entry[0]['pos_id']} "
+                            f"in der Historie - CLOSE-Zeile fehlt im Journal.")
+                plan = self.state["plans"].get(entry[0]["plan_id"])
+                if plan and plan.get("status") == "gefüllt":
+                    plan["status"] = "unbekannt"
+                    self.save_state()
 
     def reconcile_plans(self):
-        """Wartende Orders, die beim Broker verschwunden sind: zwischen zwei Durchläufen gefüllt
-        (und evtl. schon geschlossen) oder vom Broker verfallen lassen?"""
+        """Orders und Positionen, die beim Broker verschwunden sind, ohne dass der Bot es gesehen hat
+        (zwischen zwei Durchläufen oder während der Bot aus war): gefüllt, geschlossen, verfallen?"""
         m = self.mt5
         orders, positions = self.my_orders(), self.my_positions()
         if orders is None or positions is None:
             return
         live = {o.ticket for o in orders} | {p.identifier for p in positions}
+        waiting = {e[0]["plan_id"] for e in self.pending_close.values()}
         changed = False
         for tk, plan in self.state["plans"].items():
-            if plan.get("status") != "wartet" or int(tk) in live:
+            if int(tk) in live:
+                continue
+            if plan.get("status") == "gefüllt" and tk not in waiting:
+                # Position wurde geschlossen, während der Bot aus war -> CLOSE-Zeile nachtragen
+                self.pending_close[int(tk)] = [{"symbol": plan.get("symbol"), "plan_id": tk, "pos_id": int(tk)}, 0]
+                continue
+            if plan.get("status") != "wartet":
                 continue
             deals = m.history_deals_get(position=int(tk)) or ()
             ins = [d for d in deals if d.entry == m.DEAL_ENTRY_IN]
@@ -608,7 +643,7 @@ class SmcBot:
         for o in orders:
             plan = self.state["plans"].get(str(o.ticket), {})
             armed = plan.get("armed_t")
-            too_old = self.clock() - plan.get("placed_utc", self.clock()) > max_age
+            too_old = self.now() - plan.get("placed_utc", self.now()) > max_age
             if armed not in held or too_old:
                 why = "zu alt" if armed in held else self.dropped.get((key, armed), "Setup nicht mehr gültig")
                 self.cancel_order(o, why)
@@ -622,7 +657,7 @@ class SmcBot:
         live_pos, live_ord = self.my_positions(sym), self.my_orders(sym)
         if live_pos is None or live_ord is None:
             return  # Abfrage fehlgeschlagen -> im nächsten Durchlauf erneut
-        if prev == newest:
+        if prev is not None and newest <= prev:      # keine neue Kerze (oder kurz unvollständige Daten)
             if key in self.held and live_ord:
                 self.cancel_dropped(key, live_ord)   # fehlgeschlagene Löschungen sofort wiederholen
             return
@@ -702,14 +737,10 @@ class SmcBot:
 
         # Ablauf beim Broker: so lange, wie die Engine auf den Retest wartet, höchstens bis zum Schluss
         end_utc = min(o["armed_t"] + (self.eng["entry_window"] + 1) * 300, self.flat_utc(day))
-        em = int(getattr(info, "expiration_mode", 0) or 0)
-        if em & EXP_SPECIFIED:
-            timing = {"type_time": m.ORDER_TIME_SPECIFIED, "expiration": int(end_utc + self.srv.offset_at(end_utc))}
-        elif em & EXP_DAY:
-            timing = {"type_time": m.ORDER_TIME_DAY}
-        else:
-            timing = {"type_time": m.ORDER_TIME_GTC}
-            log.warning(f"{sym}: Broker erlaubt keinen Order-Verfall - die Order verfällt nicht von selbst.")
+        if not int(getattr(info, "expiration_mode", 0) or 0) & EXP_SPECIFIED:
+            # ohne feste Ablaufzeit könnte die Order nach einem Absturz noch nach Schluss gefüllt werden
+            return skip("Broker erlaubt keine Ablaufzeit für Limit-Orders (expiration_mode)")
+        timing = {"type_time": m.ORDER_TIME_SPECIFIED, "expiration": int(end_utc + self.srv.offset_at(end_utc))}
 
         sized = self.calc_lots(sym, info, long, entry, sl)
         if isinstance(sized, str):
@@ -726,7 +757,7 @@ class SmcBot:
         self.state["plans"][str(res.order)] = {
             "key": key, "symbol": sym, "dir": o["dir"], "armed_t": o["armed_t"], "entry": entry,
             "sl": sl, "tp": tp, "lots": lots, "risk_money": risk_money, "chain": chain,
-            "placed_utc": self.clock(), "status": "wartet"}
+            "placed_utc": self.now(), "status": "wartet"}
         self.prune_plans()
         self.save_state()
         log.info(f"★ {head}: Limit {lots} @ {entry} | SL {sl} | TP {tp} | Risiko {risk_money:.2f} | "
@@ -736,7 +767,7 @@ class SmcBot:
                       "kapital": self.equity_txt()})
 
     def prune_plans(self, keep_days=14):
-        cutoff = self.clock() - keep_days * 86400
+        cutoff = self.now() - keep_days * 86400
         plans = self.state["plans"]
         for k in [k for k, v in plans.items() if v.get("status") in ("geschlossen", "storniert", "unbekannt")
                   and v.get("placed_utc", 0) < cutoff]:
@@ -748,12 +779,12 @@ class SmcBot:
         return f"{acc.equity:.2f}" if acc else ""
 
     def heartbeat(self, force=False):
-        if not force and self.clock() - self.last_heartbeat < C.HEARTBEAT_MINUTES * 60:
+        if not force and self.now() - self.last_heartbeat < C.HEARTBEAT_MINUTES * 60:
             return
-        self.last_heartbeat = self.clock()
+        self.last_heartbeat = self.now()
         acc = self.mt5.account_info()
         eq = f"Kapital {acc.equity:.2f} {acc.currency}" if acc else "Kapital ?"
-        log.info(f"♥ {ny_ts(self.clock()):%H:%M} New York - {eq}, {len(self.my_positions() or [])} Position(en), "
+        log.info(f"♥ {ny_ts(self.now()):%H:%M} New York - {eq}, {len(self.my_positions() or [])} Position(en), "
                  f"{len(self.my_orders() or [])} Limit-Order(s){' - TAGESGRENZE AKTIV' if self.state.get('kill') else ''}"
                  f"{'' if self.clock_ok else ' - SERVERZEIT NICHT BESTÄTIGT'}")
         for key in self.symbols:
@@ -802,8 +833,8 @@ class SmcBot:
                  f"Serverzeit-Regel '{C.SERVER_TZ}'")
         self.acquire_lock()
         self.connect()
-        self.known_positions = {p.ticket: {"symbol": p.symbol, "plan_id": str(p.identifier), "pos_id": p.identifier}
-                                for p in self.my_positions() or []}
+        # offene Positionen übernimmt track_positions im ersten Durchlauf - so bekommt auch eine
+        # Order, die gefüllt wurde, während der Bot aus war, ihre OPEN-Zeile
         log.info("Warte auf neue Kerzen ... (Stopp: Strg + C - SL/TP bleiben beim Broker aktiv)")
         try:
             while True:

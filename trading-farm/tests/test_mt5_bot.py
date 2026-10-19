@@ -147,6 +147,12 @@ class Safety(unittest.TestCase):
         fake.advance_to(int(df.t.iloc[at]) + 305)
         return fake, SmcBot(fake, clock=lambda: fake.now, cfg=CFG, workdir=Path(self.tmp.name))
 
+    def confirm_clock(self, fake, bot, seconds=10):
+        """The clock is only measured on a tick that is new since the previous check."""
+        bot.check_clock()
+        fake.advance_to(fake.now + seconds)
+        bot.check_clock()
+
     def plan_for_try(self):
         return {"dir": "long", "entry": 1, "sl": 0.9, "tp": 1.2, "armed_t": 1, "sweep_lb": "PDL", "sweep_p": 1,
                 "mss_k": "mss", "mss_p": 1, "zone": {"type": "FVG", "bot": 1, "top": 1}}
@@ -176,7 +182,7 @@ class Safety(unittest.TestCase):
     def test_daily_loss_limit_blocks_new_orders(self):
         fake, bot = self.bot()
         bot.connect()
-        bot.check_clock()
+        self.confirm_clock(fake, bot)
         bot.daily_guard()
         fake.balance *= 1 - (C.DAILY_LOSS_LIMIT_PERCENT + 0.5) / 100
         bot.daily_guard()
@@ -189,7 +195,7 @@ class Safety(unittest.TestCase):
         C.SERVER_TZ = "UTC+2"                  # broker really runs NY+7 (= UTC+3 in October)
         fake, bot = self.bot()
         bot.connect()
-        bot.check_clock()
+        self.confirm_clock(fake, bot)
         self.assertIs(bot.clock_ok, False)
         n = len(fake.sent)
         bot.try_place("TST", "TST.US", self.plan_for_try(), "2026-10-16")
@@ -242,6 +248,80 @@ class Safety(unittest.TestCase):
         self.assertEqual(ny_minutes(fake.now), 12 * 60 + 55)
         bot.flat_guard()
         self.assertNotIn(5, fake.positions)
+
+
+    def test_stale_tick_does_not_flip_the_clock(self):
+        fake, bot = self.bot()
+        bot.connect()
+        self.confirm_clock(fake, bot)
+        self.assertIs(bot.clock_ok, True)
+        frozen = fake.symbol_info_tick("TST.US")
+        fake.symbol_info_tick = lambda s: frozen            # market closed: no new ticks
+        for minutes in (25, 30, 60, 90):                     # old ticks look like a wrong time zone
+            fake.now = frozen.time - fake.offset(fake.now) + minutes * 60
+            bot.check_clock()
+            self.assertIs(bot.clock_ok, True, minutes)
+
+    def test_slow_pc_clock_blocks_orders_but_flattening_follows_the_broker(self):
+        df = data.make_demo("TST", days=3, seed=1, end="2026-10-16")
+        fake = FakeMT5({"TST.US": df})
+        fake.advance_to(int(df.t.iloc[75]) + 305)                           # 15:50:05 New York
+        bot = SmcBot(fake, clock=lambda: fake.now - 480, cfg=CFG, workdir=Path(self.tmp.name))   # PC 8 min slow
+        bot.connect()
+        self.confirm_clock(fake, bot)
+        self.assertIs(bot.clock_ok, False)
+        self.assertAlmostEqual(bot.now(), fake.now, delta=15)
+        n = len(fake.sent)
+        bot.try_place("TST", "TST.US", self.plan_for_try(), "2026-10-14")
+        self.assertEqual(len(fake.sent), n)
+        fake.positions[5] = SimpleNamespace(ticket=5, identifier=5, symbol="TST.US", magic=C.MAGIC_NUMBER, volume=1.0,
+                                            type=0, price_open=100.0, sl=1.0, tp=500.0, comment="", time=0)
+        fake.advance_to(int(df.t.iloc[76]) + 305)                           # 15:55:05 NY, PC shows 15:47
+        bot.flat_guard()
+        self.assertNotIn(5, fake.positions)
+
+    def test_no_order_without_broker_expiry(self):
+        fake, bot = self.bot(expiration_mode=2)                             # DAY only
+        bot.connect()
+        self.confirm_clock(fake, bot)
+        self.assertIs(bot.clock_ok, True)
+        n = len(fake.sent)
+        bot.try_place("TST", "TST.US", self.plan_for_try(), "2026-10-14")
+        self.assertEqual(len(fake.sent), n)
+        self.assertIn("Ablaufzeit", (Path(self.tmp.name) / C.JOURNAL_FILE).read_text(encoding="utf-8"))
+
+    def test_bar_going_backwards_keeps_the_order(self):
+        fake, bot = self.bot()
+        bot.connect()
+        fake.orders[77] = SimpleNamespace(ticket=77, symbol="TST.US", magic=C.MAGIC_NUMBER, type=2, price_open=1.0,
+                                          sl=0.9, tp=1.2, volume_current=1.0, comment="", time_setup=0,
+                                          type_time=2, expiration=fake.srv(fake.now + 3600))
+        bot.state["plans"]["77"] = {"key": "TST", "armed_t": 123, "placed_utc": fake.now, "status": "wartet"}
+        bot.held["TST"] = {123}
+        bot.last_bar["TST"] = int(fake.now) + 600    # a later bar was seen already; the data lags for one poll
+        bot.process_symbol("TST", "TST.US")
+        self.assertIn(77, fake.orders)
+
+    def test_trades_while_the_bot_was_stopped_are_journaled(self):
+        fake, bot = self.bot()
+        # 42: filled before the stop, closed by its stop-loss while the bot was off
+        bot.state["plans"]["42"] = {"key": "TST", "symbol": "TST.US", "dir": "long", "risk_money": 10.0,
+                                    "status": "gefüllt", "placed_utc": fake.now}
+        fake._deal(42, "TST.US", C.MAGIC_NUMBER, fake.DEAL_ENTRY_IN, 100.0, 1.0, 0.0, fake.DEAL_REASON_EXPERT, fake.now)
+        fake._deal(42, "TST.US", C.MAGIC_NUMBER, fake.DEAL_ENTRY_OUT, 99.0, 1.0, -1.0, fake.DEAL_REASON_SL, fake.now)
+        # 43: limit order filled while the bot was off, position still open
+        bot.state["plans"]["43"] = {"key": "TST", "symbol": "TST.US", "dir": "long", "risk_money": 10.0,
+                                    "status": "wartet", "placed_utc": fake.now}
+        fake.positions[43] = SimpleNamespace(ticket=43, identifier=43, symbol="TST.US", magic=C.MAGIC_NUMBER,
+                                             volume=1.0, type=0, price_open=100.0, sl=90.0, tp=120.0, comment="", time=0)
+        bot.connect()
+        bot.step()
+        bot.step()
+        journal = (Path(self.tmp.name) / C.JOURNAL_FILE).read_text(encoding="utf-8")
+        self.assertEqual(journal.count(";CLOSE;"), 1)
+        self.assertEqual(journal.count(";OPEN;"), 1)
+        self.assertEqual(bot.state["plans"]["42"]["status"], "geschlossen")
+        self.assertEqual(bot.state["plans"]["43"]["status"], "gefüllt")
 
 
 class EarlyCloseEngine(unittest.TestCase):

@@ -19,8 +19,9 @@ Das Sicherheitskonzept stammt von deinem Trend-Bot und wurde erweitert.
    beim Start passende Namen ins Fenster.
 4. **Serverzeit-Regel prüfen:** MT5 liefert alle Kerzen in der Uhrzeit des Brokers. Die meisten
    Broker laufen auf „New York + 7 Stunden“, das ist in `mt5_config.py` als `SERVER_TZ = "NY+7"`
-   voreingestellt. Der Bot prüft das beim Start an den Live-Kursen. Passt es nicht, steht im
-   Fenster zum Beispiel „Broker-Serverzeit ist UTC+2.0 h …“, und er platziert keine Orders.
+   voreingestellt. Der Bot prüft das an den Live-Kursen, sobald neue Kurse hereinkommen. Passt
+   es nicht, steht im Fenster zum Beispiel „Broker-Serverzeit ist UTC+2.0 h …“, und er
+   platziert keine Orders.
    Dann `SERVER_TZ` anpassen:
    - `"Europe/Athens"` für GMT+2/+3 mit europäischer Umstellung
    - `"UTC+2"` für eine feste Zeit ohne Umstellung
@@ -60,18 +61,19 @@ Bei jeder neuen 5-Minuten-Kerze in der regulären US-Handelszeit:
 | Schutz | Was passiert |
 |---|---|
 | Nur Demokonto | Auf Echtgeldkonten bricht der Bot ab (`ALLOW_REAL_ACCOUNT = False`). Wechselt jemand im laufenden Terminal das Konto, handelt er nicht mehr, bis das Startkonto zurück ist. |
-| Order-Verfall | Jede Limit-Order verfällt **beim Broker** von selbst, spätestens um 15:55. Das gilt auch, wenn der Bot abstürzt oder der PC ausgeht. |
+| Order-Verfall | Jede Limit-Order verfällt **beim Broker** von selbst, spätestens um 15:55. Das gilt auch, wenn der Bot abstürzt oder der PC ausgeht. Erlaubt der Broker keine Ablaufzeit, platziert der Bot keine Orders. |
 | SL/TP-Wächter | Jede Position braucht SL und TP beim Broker. Fehlt etwas, rüstet er es nach, sonst schließt er die Position. Das wird in jeder Runde geprüft. |
 | Lotgröße | Der Broker rechnet selbst (`order_calc_profit`). Die Größe wird immer abgerundet, und reicht die Margin nicht, wird sie verkleinert. |
 | Keine Doppel-Orders | Höchstens eine Position oder Order pro Aktie und `MAX_OPEN_POSITIONS` insgesamt. Nach einer Teilausführung wird nichts erneut gesendet. |
 | Tagesverlust-Grenze | Bei −3 % vom Kapital zu Tagesbeginn kommen an diesem Tag keine neuen Orders mehr (`DAILY_LOSS_LIMIT_PERCENT`, 0 = aus). Diese Grenze gibt es im Backtest nicht. |
 | Zeitumstellung | Die Serverzeit wird für jede Kerze einzeln umgerechnet, also auch über Sommer-/Winterzeit hinweg richtig. Passt die Regel nicht zu den Live-Kursen, kommen keine Orders. |
+| PC-Uhr | Geht die Windows-Uhr mehr als 1 Minute falsch, kommen keine neuen Orders. Glattgestellt wird dann nach der Uhr des Brokers, also trotzdem rechtzeitig. |
 | Fehler | Ein einzelner Fehler (z.B. Journal in Excel geöffnet) stoppt den Bot nicht. Journal-Zeilen werden später nachgetragen. |
 | Nur einmal starten | Ein zweites Bot-Fenster im selben Ordner bricht sofort ab. |
 | Spread-Filter | Kein Trade, wenn der Spread mehr als 20 % des Stop-Abstands ausmacht. |
 | Algo-Handel aus | Keine neuen Orders, solange der Knopf im Terminal aus ist. |
 | Verbindung weg | Der Bot verbindet sich automatisch neu. |
-| Neustart | Der Zustand liegt in `bot_smc_state.json`. Alte Signale werden nicht nachgehandelt. |
+| Neustart | Der Zustand liegt in `bot_smc_state.json`. Alte Signale werden nicht nachgehandelt. Was der Broker ausgeführt hat, während der Bot aus war (Order gefüllt, SL/TP getroffen), wird im Journal nachgetragen. |
 
 Mit deinem Trend-Bot kann er **gleichzeitig auf demselben Konto** laufen. Er hat eine eigene
 Kennung (`MAGIC_NUMBER = 200002`) und fasst die Trades des anderen Bots nicht an.
@@ -91,4 +93,6 @@ Kennung (`MAGIC_NUMBER = 200002`) und fasst die Trades des anderen Bots nicht an
 | `Symbol 'NVDA' beim Broker nicht gefunden` | Den vorgeschlagenen Namen in `mt5_config.py` → `MARKETS` eintragen |
 | `Algo-Handel ist im MT5-Terminal AUS` | Den Knopf „Algo Trading“ oben im MT5 einschalten |
 | `Broker hat abgelehnt (Retcode …)` | Die Nummer im MT5-Journal nachsehen oder mir schicken |
+| `Die PC-Uhr geht … s vor/nach` | Windows: Einstellungen → Zeit und Sprache → Datum und Uhrzeit → „Jetzt synchronisieren“. Der Bot merkt es selbst, wenn die Uhr wieder stimmt. |
+| `Broker erlaubt keine Ablaufzeit für Limit-Orders` | Bei diesem Broker verfallen Limit-Orders nicht von selbst. Der Bot handelt dort nicht, weil eine Order sonst nach einem Absturz noch nach Börsenschluss gefüllt werden könnte. Ein anderer Broker bzw. anderes Demokonto ist nötig. |
 | Es kommen keine Orders | Das ist normal, die Strategie ist sehr wählerisch. Die Gründe stehen als `SKIP` im Journal, und im Dashboard siehst du, warum die Engine Setups ablehnt. |
