@@ -67,21 +67,27 @@ def fetch_yahoo(sym, period="60d"):
     return df[df.t + 300 <= time.time()].reset_index(drop=True)
 
 
-def make_demo(sym, days=60, seed=None):
+def make_demo(sym, days=60, seed=None, end=None, early_close=None):
     """Synthetic intraday random walk with volatility clustering and U-shaped volume.
 
     Only meant for trying the dashboard without internet - not real prices.
     """
     rng = np.random.default_rng(seed if seed is not None else int.from_bytes(sym.encode(), "little") % 2**32)
     start = {"SPY": 560, "QQQ": 480, "AAPL": 225, "NVDA": 130, "TSLA": 250}.get(sym, 100.0)
-    end_day = pd.Timestamp.now(tz=NY).normalize() - pd.Timedelta(days=1)
-    sessions = pd.bdate_range(end=end_day.tz_localize(None), periods=days)
+    end_day = (pd.Timestamp(end) if end is not None
+               else pd.Timestamp.now(tz=NY).normalize().tz_localize(None) - pd.Timedelta(days=1))
+    sessions = pd.bdate_range(end=end_day, periods=days)
+    early_close = early_close or {}
     rows, price, vol = [], float(start), 0.0012
     for d in sessions:
         open_ts = pd.Timestamp(d.year, d.month, d.day, 9, 30, tz=NY)
         price *= 1 + rng.normal(0, 0.004)  # overnight gap
         drift = rng.normal(0, 0.0003)
-        for k in range(78):
+        n_bars = 78
+        if d.strftime("%Y-%m-%d") in early_close:
+            hh, mm = early_close[d.strftime("%Y-%m-%d")].split(":")
+            n_bars = (int(hh) * 60 + int(mm) - SESSION_OPEN_MIN) // 5
+        for k in range(n_bars):
             vol = max(0.0005, 0.94 * vol + 0.06 * 0.0012 + rng.normal(0, 0.00015))
             ushape = 1.6 if k < 6 or k > 70 else 1.0
             o = price

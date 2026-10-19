@@ -35,14 +35,20 @@ MARKETS = {
 RISK_PERCENT = 1.0             # % des Kapitals, das pro Trade riskiert wird
 MAX_OPEN_POSITIONS = 3         # offene Positionen + wartende Limit-Orders zusammen
 DAILY_LOSS_LIMIT_PERCENT = 3.0 # Tagesverlust (vom Kapital zu Tagesbeginn), ab dem für
-                               # den Rest des Tages keine neuen Orders mehr kommen
+                               # den Rest des Tages keine neuen Orders mehr kommen (0 = aus)
 MAX_SPREAD_OF_RISK = 0.20      # Spread darf höchstens 20 % des Stop-Abstands sein
 
 # --- Zeit ---
-# Abstand der Broker-Serverzeit zu UTC in Stunden (z.B. 3 im Sommer bei vielen
-# Brokern). None = automatisch aus den Live-Kursen erkennen (empfohlen).
-SERVER_UTC_OFFSET_HOURS = None
-CLOCK_SYMBOLS = ["EURUSD"]     # Symbole mit fast durchgehenden Kursen für die Zeiterkennung
+# Nach welcher Regel läuft die Uhr deines Brokers? MT5 liefert alle Kerzen in Serverzeit,
+# und viele Broker stellen auf Sommer-/Winterzeit um. Die Regel gilt für jede Kerze einzeln.
+#   "NY+7"          Serverzeit = New-York-Zeit + 7 h  (GMT+2 im Winter / GMT+3 im Sommer,
+#                   Umstellung mit den USA - bei den meisten MT5-Brokern so)
+#   "Europe/Athens" GMT+2/+3 mit EUROPÄISCHER Umstellung
+#   "UTC+2"         feste Verschiebung ohne Umstellung
+# Der Bot prüft die Regel laufend an den Live-Kursen. Passt sie nicht, meldet er die
+# gemessene Serverzeit und platziert keine Orders, bis du sie hier korrigiert hast.
+SERVER_TZ = "NY+7"
+CLOCK_SYMBOLS = ["EURUSD"]     # Symbole mit fast durchgehenden Kursen für die Zeitprüfung
 
 # --- Technik ---
 BARS_HISTORY = 6000            # wie viele 5-Minuten-Kerzen geladen werden (~4-8 Wochen)

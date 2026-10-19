@@ -6,3 +6,4 @@ mt5/bot_smc.log
 mt5/trades_smc.csv
 mt5/bot_smc_state.json
 mt5/*.tmp
+mt5/bot_smc.lock

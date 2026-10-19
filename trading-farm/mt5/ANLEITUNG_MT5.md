@@ -17,6 +17,13 @@ Das Sicherheitskonzept stammt von deinem Trend-Bot und wurde erweitert.
 3. **Symbolnamen eintragen:** In `mt5_config.py` unter `MARKETS` die Namen deines Brokers
    eintragen, zum Beispiel `"NVDA": "NVDA.US"`. Findet der Bot ein Symbol nicht, schreibt er
    beim Start passende Namen ins Fenster.
+4. **Serverzeit-Regel prüfen:** MT5 liefert alle Kerzen in der Uhrzeit des Brokers. Die meisten
+   Broker laufen auf „New York + 7 Stunden“, das ist in `mt5_config.py` als `SERVER_TZ = "NY+7"`
+   voreingestellt. Der Bot prüft das beim Start an den Live-Kursen. Passt es nicht, steht im
+   Fenster zum Beispiel „Broker-Serverzeit ist UTC+2.0 h …“, und er platziert keine Orders.
+   Dann `SERVER_TZ` anpassen:
+   - `"Europe/Athens"` für GMT+2/+3 mit europäischer Umstellung
+   - `"UTC+2"` für eine feste Zeit ohne Umstellung
 
 ## Starten
 
@@ -42,18 +49,25 @@ Bei jeder neuen 5-Minuten-Kerze in der regulären US-Handelszeit:
    **Limit-Order mit Stop-Loss und Take-Profit** beim Broker.
 4. Verwirft die Engine das Setup (kein Retest, Kurs weggelaufen, Zeit abgelaufen),
    löscht er die Limit-Order.
-5. Mit der Kerze, die um **15:55 New York** endet, stellt er alles glatt. Danach hält er
-   nichts mehr, auch nicht über Nacht.
+5. Mit der Kerze, die um **15:55 New York** endet, stellt er alles glatt. An **halben
+   Handelstagen** (Schluss um 13:00, z.B. 27.11. und 24.12.) passiert das schon um 12:55.
+   Danach hält er nichts mehr, auch nicht über Nacht. Die halben Tage stehen in `../config.json`
+   unter `early_close` und müssen jedes Jahr ergänzt werden
+   (NYSE-Feiertagskalender: nyse.com/markets/hours-calendars).
 
 ## Sicherheit
 
 | Schutz | Was passiert |
 |---|---|
-| Nur Demokonto | Auf Echtgeldkonten bricht der Bot ab (`ALLOW_REAL_ACCOUNT = False`) |
+| Nur Demokonto | Auf Echtgeldkonten bricht der Bot ab (`ALLOW_REAL_ACCOUNT = False`). Wechselt jemand im laufenden Terminal das Konto, handelt er nicht mehr, bis das Startkonto zurück ist. |
+| Order-Verfall | Jede Limit-Order verfällt **beim Broker** von selbst, spätestens um 15:55. Das gilt auch, wenn der Bot abstürzt oder der PC ausgeht. |
 | SL/TP-Wächter | Jede Position braucht SL und TP beim Broker. Fehlt etwas, rüstet er es nach, sonst schließt er die Position. Das wird in jeder Runde geprüft. |
 | Lotgröße | Der Broker rechnet selbst (`order_calc_profit`). Die Größe wird immer abgerundet, und reicht die Margin nicht, wird sie verkleinert. |
 | Keine Doppel-Orders | Höchstens eine Position oder Order pro Aktie und `MAX_OPEN_POSITIONS` insgesamt. Nach einer Teilausführung wird nichts erneut gesendet. |
-| Tagesverlust-Grenze | Bei −3 % vom Kapital zu Tagesbeginn kommen an diesem Tag keine neuen Orders mehr. |
+| Tagesverlust-Grenze | Bei −3 % vom Kapital zu Tagesbeginn kommen an diesem Tag keine neuen Orders mehr (`DAILY_LOSS_LIMIT_PERCENT`, 0 = aus). Diese Grenze gibt es im Backtest nicht. |
+| Zeitumstellung | Die Serverzeit wird für jede Kerze einzeln umgerechnet, also auch über Sommer-/Winterzeit hinweg richtig. Passt die Regel nicht zu den Live-Kursen, kommen keine Orders. |
+| Fehler | Ein einzelner Fehler (z.B. Journal in Excel geöffnet) stoppt den Bot nicht. Journal-Zeilen werden später nachgetragen. |
+| Nur einmal starten | Ein zweites Bot-Fenster im selben Ordner bricht sofort ab. |
 | Spread-Filter | Kein Trade, wenn der Spread mehr als 20 % des Stop-Abstands ausmacht. |
 | Algo-Handel aus | Keine neuen Orders, solange der Knopf im Terminal aus ist. |
 | Verbindung weg | Der Bot verbindet sich automatisch neu. |

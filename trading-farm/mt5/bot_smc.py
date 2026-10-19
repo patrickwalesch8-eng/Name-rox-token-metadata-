@@ -2,20 +2,24 @@
 MT5-Autopilot der Aktien Data Farm - SMC-Engine (Sweep -> MSS -> FVG/OB) auf US-Aktien-CFDs.
 
 Ablauf bei jeder neu geschlossenen 5-Minuten-Kerze (reguläre US-Handelszeit):
-  1. Kerzen vom MT5-Terminal holen, Broker-Serverzeit in New-York-Zeit umrechnen
+  1. Kerzen vom MT5-Terminal holen; Broker-Serverzeit pro Kerze (sommer-/winterzeitfest)
+     in New-York-Zeit umrechnen
   2. Dieselbe Erkennung + Engine wie im Dashboard laufen lassen (farmlib)
   3. Hat die Engine GENAU AUF DIESER KERZE ein Setup scharf gemacht:
-     Limit-Order beim Broker MIT Stop-Loss und Take-Profit platzieren
-  4. Hat die Engine ein Setup verworfen (kein Retest, weggelaufen, ...):
+     Limit-Order beim Broker MIT Stop-Loss, Take-Profit und Ablaufzeit platzieren
+  4. Hält die Engine das Setup nicht mehr (kein Retest, weggelaufen, ...):
      die passende Limit-Order beim Broker löschen
-  5. Mit der Kerze, die um flat_at (15:55 New York) endet: alles glattstellen
+  5. Mit der Kerze, die um flat_at (15:55 New York; an halben Tagen 12:55) endet:
+     alles glattstellen
 
 Sicherheit (Konzept vom Trend-Bot übernommen und erweitert):
-  - startet nicht auf Echtgeldkonten (ALLOW_REAL_ACCOUNT)
+  - handelt nur auf dem Demokonto, mit dem er gestartet wurde (auch nach Kontowechsel/Neuverbinden)
   - jede Position hat SL/TP beim Broker; fehlt etwas -> nachrüsten, sonst schließen
-  - Lotgröße rechnet der Broker selbst (order_calc_profit), abgerundet
-  - max. eine Position/Order pro Aktie, MAX_OPEN_POSITIONS gesamt
-  - Tagesverlust-Grenze, Spread-Filter, Neustart-fest (Zustand in einer Datei)
+  - Limit-Orders verfallen beim Broker von selbst, auch wenn der Bot abstürzt
+  - Lotgröße rechnet der Broker selbst (order_calc_profit), abgerundet, durch Margin begrenzt
+  - max. eine Position/Order pro Aktie, MAX_OPEN_POSITIONS gesamt; nie Doppel-Orders
+  - Tagesverlust-Grenze, Spread-Filter, Uhrzeit-Prüfung, nur eine Instanz gleichzeitig
+  - ein Fehler (z.B. Journal in Excel geöffnet) stoppt den Bot nicht
   - beim Start werden keine alten Signale nachgehandelt
 
 Start:  python bot_smc.py      Stopp:  Strg + C (SL/TP bleiben beim Broker aktiv)
@@ -28,7 +32,6 @@ import math
 import os
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -48,8 +51,15 @@ log = logging.getLogger("bot_smc")
 JOURNAL_COLS = ["zeit_ny", "ereignis", "markt", "symbol", "richtung", "lots", "entry", "sl", "tp",
                 "exit", "risiko", "gewinn", "r", "gebuehren", "grund", "setup", "kapital"]
 
-RET_PLACED, RET_DONE, RET_DONE_PARTIAL, RET_INVALID_FILL = 10008, 10009, 10010, 10030
+# Rückgabecodes von order_send (MQL5 "Trade Server Return Codes")
+RET_REQUOTE, RET_PLACED, RET_DONE, RET_DONE_PARTIAL = 10004, 10008, 10009, 10010
+RET_PRICE_CHANGED, RET_PRICE_OFF, RET_TOO_MANY, RET_INVALID_FILL, RET_CONNECTION = 10020, 10021, 10024, 10030, 10031
 OK_RETCODES = (RET_PLACED, RET_DONE, RET_DONE_PARTIAL)
+# bei diesen Codes hat der Broker nichts ausgeführt -> erneuter Versuch ist gefahrlos
+RETRY_SAFE = (RET_REQUOTE, RET_PRICE_CHANGED, RET_PRICE_OFF, RET_TOO_MANY, RET_CONNECTION)
+# Bitfeld symbol_info.expiration_mode und Order-Zustände der Historie
+EXP_GTC, EXP_DAY, EXP_SPECIFIED = 1, 2, 4
+ORDER_STATE_CANCELED, ORDER_STATE_REJECTED, ORDER_STATE_EXPIRED = 2, 5, 6
 
 
 def setup_logging():
@@ -62,8 +72,47 @@ def setup_logging():
         log.addHandler(h)
 
 
-def ny_now(ts: float) -> datetime:
-    return pd.Timestamp(ts, unit="s", tz="UTC").tz_convert(data.NY).to_pydatetime()
+def ny_ts(ts: float) -> pd.Timestamp:
+    return pd.Timestamp(ts, unit="s", tz="UTC").tz_convert(data.NY)
+
+
+class ServerClock:
+    """Umrechnung Broker-Serverzeit <-> UTC nach der Regel SERVER_TZ - für jeden Zeitpunkt
+    einzeln, also auch über Sommer-/Winterzeit-Umstellungen hinweg korrekt.
+
+    "NY+7"          Serverzeit = New-York-Zeit + 7 h (GMT+2/+3 mit US-Umstellung, sehr verbreitet)
+    "UTC+2"         feste Verschiebung ohne Umstellung
+    "Europe/Athens" beliebige IANA-Zeitzone (z.B. GMT+2/+3 mit EU-Umstellung)
+    """
+
+    def __init__(self, rule: str):
+        self.rule = rule.strip()
+        r = self.rule.upper()
+        self.kind, self.hours, self.tz = "tz", 0.0, self.rule
+        if r.startswith("NY"):
+            self.kind, self.hours = "ny", float(r[2:] or 0)
+        elif r.startswith("UTC") or r.startswith("GMT"):
+            self.kind, self.hours = "fixed", float(r[3:] or 0)
+
+    def offset_at(self, utc_ts: float) -> int:
+        """Serverzeit minus UTC (Sekunden) zum Zeitpunkt utc_ts."""
+        if self.kind == "fixed":
+            return int(self.hours * 3600)
+        ts = pd.Timestamp(utc_ts, unit="s", tz="UTC")
+        if self.kind == "ny":
+            return int(ts.tz_convert(data.NY).utcoffset().total_seconds() + self.hours * 3600)
+        return int(ts.tz_convert(self.tz).utcoffset().total_seconds())
+
+    def to_utc(self, server_secs) -> pd.DatetimeIndex:
+        """Serverzeiten (Sekunden) -> UTC; nicht eindeutige Zeiten (Umstellungsstunde) -> NaT."""
+        srv = pd.to_datetime(server_secs, unit="s")
+        if self.kind == "fixed":
+            return (srv - pd.Timedelta(hours=self.hours)).tz_localize("UTC")
+        if self.kind == "ny":
+            loc = (srv - pd.Timedelta(hours=self.hours)).tz_localize(data.NY, ambiguous="NaT", nonexistent="NaT")
+        else:
+            loc = srv.tz_localize(self.tz, ambiguous="NaT", nonexistent="NaT")
+        return loc.tz_convert("UTC")
 
 
 class SmcBot:
@@ -73,19 +122,28 @@ class SmcBot:
         self.cfg = cfg or json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
         self.eng = self.cfg["engine"]
         self.flat_m = hhmm(self.eng.get("flat_at", "16:00"))
+        self.early = {d: hhmm(v) for d, v in (self.eng.get("early_close") or {}).items()}
+        self.srv = ServerClock(C.SERVER_TZ)
         self.workdir = Path(workdir)
-        self.symbols: dict[str, str] = {}       # farm name -> broker symbol
-        self.last_bar: dict[str, int] = {}      # farm name -> newest processed bar (UTC)
+        self.symbols: dict[str, str] = {}       # Farm-Name -> Broker-Symbol
+        self.last_bar: dict[str, int] = {}      # Farm-Name -> zuletzt verarbeitete Kerze (UTC)
+        self.held: dict[str, set] = {}          # Farm-Name -> armed_t, die die Engine noch hält
+        self.dropped: dict[tuple, str] = {}     # (Farm-Name, armed_t) -> Grund, warum die Engine verwarf
         self.status: dict[str, str] = {}
-        self.offset = None                      # broker server time - UTC, seconds
+        self.login = None
+        self.clock_ok = None                    # None = noch nicht geprüft
+        self.account_ok = True
+        self.trading_ok = True
         self.known_positions: dict[int, dict] = {}
+        self.pending_close: dict[int, list] = {}
+        self.journal_backlog: list[dict] = []
+        self.journal_warned = False
         self.last_heartbeat = 0.0
         self.last_flat_try = 0.0
-        self.trading_ok = True
         self.state = {"plans": {}, "day": None, "day_equity": None, "kill": False}
         self.load_state()
 
-    # ------------------------------------------------------------------ state / journal
+    # ------------------------------------------------------------------ Zustand / Journal
     def path(self, name):
         return self.workdir / name
 
@@ -100,25 +158,42 @@ class SmcBot:
     def save_state(self):
         p = self.path(C.STATE_FILE)
         tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, indent=1), encoding="utf-8")
-        os.replace(tmp, p)
+        try:
+            tmp.write_text(json.dumps(self.state, indent=1), encoding="utf-8")
+            os.replace(tmp, p)
+        except OSError as exc:
+            log.error(f"Zustand konnte nicht gespeichert werden ({exc}).")
 
     def journal(self, row: dict):
+        """Journal-Zeile schreiben. Ist die Datei gesperrt (z.B. in Excel geöffnet), wird die
+        Zeile gemerkt und später nachgetragen - der Bot läuft weiter."""
+        row.setdefault("zeit_ny", ny_ts(self.clock()).strftime("%Y-%m-%d %H:%M:%S"))
+        self.journal_backlog.append(row)
         p = self.path(C.JOURNAL_FILE)
-        new = not p.exists()
-        with open(p, "a", encoding="utf-8") as f:
-            if new:
-                f.write(";".join(JOURNAL_COLS) + "\n")
-            row.setdefault("zeit_ny", ny_now(self.clock()).strftime("%Y-%m-%d %H:%M:%S"))
-            f.write(";".join(str(row.get(k, "")) for k in JOURNAL_COLS) + "\n")
+        try:
+            new = not p.exists()
+            with open(p, "a", encoding="utf-8") as f:
+                if new:
+                    f.write(";".join(JOURNAL_COLS) + "\n")
+                for r in self.journal_backlog:
+                    f.write(";".join(str(r.get(k, "")) for k in JOURNAL_COLS) + "\n")
+            self.journal_backlog.clear()
+            self.journal_warned = False
+        except OSError as exc:
+            if not self.journal_warned:
+                log.error(f"Journal nicht schreibbar ({exc}) - ist {C.JOURNAL_FILE} in Excel geöffnet? "
+                          f"Die Zeilen werden nachgetragen, sobald die Datei frei ist.")
+                self.journal_warned = True
 
-    # ------------------------------------------------------------------ connection
+    # ------------------------------------------------------------------ Verbindung / Konto
+    def init_kwargs(self):
+        if C.MT5_LOGIN:
+            return dict(login=C.MT5_LOGIN, password=C.MT5_PASSWORD, server=C.MT5_SERVER)
+        return {}
+
     def connect(self):
         m = self.mt5
-        kwargs = {}
-        if C.MT5_LOGIN:
-            kwargs = dict(login=C.MT5_LOGIN, password=C.MT5_PASSWORD, server=C.MT5_SERVER)
-        if not m.initialize(**kwargs):
+        if not m.initialize(**self.init_kwargs()):
             log.error(f"MT5-Initialisierung fehlgeschlagen: {m.last_error()}")
             log.error("Ist das MT5-Terminal gestartet und eingeloggt?")
             sys.exit(1)
@@ -135,24 +210,33 @@ class SmcBot:
                       "konfiguriert (ALLOW_REAL_ACCOUNT = False).")
             m.shutdown()
             sys.exit(1)
+        self.login = acc.login
         self.ensure_symbols()
 
     def ensure_connection(self) -> bool:
+        """Terminal verbunden, gleiches (Demo-)Konto wie beim Start, Algo-Handel an?"""
         m = self.mt5
-        term = m.terminal_info()
-        if term is None or not getattr(term, "connected", True):
+        if m.terminal_info() is None:
             log.warning("Verbindung zum MT5-Terminal verloren - versuche neu zu verbinden ...")
             m.shutdown()
-            if not m.initialize():
+            if not m.initialize(**self.init_kwargs()) or m.terminal_info() is None:
                 return False
-            acc = m.account_info()
-            if acc is None or (acc.trade_mode != m.ACCOUNT_TRADE_MODE_DEMO and not C.ALLOW_REAL_ACCOUNT):
-                log.error("Nach dem Neuverbinden kein (Demo-)Konto - kein Handel.")
-                return False
-            term = m.terminal_info()
-            if term is None:
-                return False
-        allowed = bool(getattr(term, "trade_allowed", True))
+            log.info("Wieder mit dem MT5-Terminal verbunden.")
+        acc = m.account_info()
+        ok = (acc is not None and acc.login == self.login
+              and (acc.trade_mode == m.ACCOUNT_TRADE_MODE_DEMO or C.ALLOW_REAL_ACCOUNT))
+        if ok != self.account_ok:
+            if ok:
+                log.info(f"Wieder mit dem Startkonto {self.login} verbunden - Bot arbeitet weiter.")
+            else:
+                log.error(f"FALSCHES KONTO: Der Bot wurde mit Demokonto {self.login} gestartet, im Terminal ist "
+                          f"jetzt {acc.login if acc else 'keins'} - der Bot handelt nicht, bis das "
+                          f"Startkonto wieder eingeloggt ist.")
+        self.account_ok = ok
+        if not ok:
+            return False
+        term = m.terminal_info()
+        allowed = bool(getattr(term, "trade_allowed", True)) if term is not None else False
         if allowed != self.trading_ok:
             if allowed:
                 log.info("Algo-Handel im Terminal ist wieder erlaubt.")
@@ -167,7 +251,7 @@ class SmcBot:
         for key, sym in C.MARKETS.items():
             info = m.symbol_info(sym)
             if info is None:
-                hints = [s.name for s in (m.symbols_get(f"*{key}*") or [])][:8]
+                hints = [s.name for s in (m.symbols_get(group=f"*{key}*") or [])][:8]
                 log.warning(f"{key}: Symbol '{sym}' beim Broker nicht gefunden - übersprungen."
                             + (f" Mögliche Namen: {', '.join(hints)}" if hints else ""))
                 continue
@@ -183,12 +267,10 @@ class SmcBot:
             m.shutdown()
             sys.exit(1)
 
-    # ------------------------------------------------------------------ time & data
-    def update_offset(self):
-        """Broker-Serverzeit minus UTC. MT5 liefert Zeiten in Serverzeit."""
-        if C.SERVER_UTC_OFFSET_HOURS is not None:
-            self.offset = int(C.SERVER_UTC_OFFSET_HOURS * 3600)
-            return
+    # ------------------------------------------------------------------ Zeit & Daten
+    def check_clock(self):
+        """Passt die gemessene Serverzeit (frischester Tick) zur Regel SERVER_TZ?
+        Wenn nicht, werden keine neuen Orders platziert (lieber nichts tun als falsch)."""
         newest = None
         for sym in list(self.symbols.values()) + list(C.CLOCK_SYMBOLS):
             tick = self.mt5.symbol_info_tick(sym)
@@ -196,46 +278,73 @@ class SmcBot:
                 newest = tick.time
         if newest is None:
             return
-        cand = round((newest - self.clock()) / 1800) * 1800
-        # ein frischer Tick liegt höchstens ein paar Minuten zurück; sonst Wert behalten
-        if abs(cand) <= 14 * 3600 and abs((newest - self.clock()) - cand) <= 600:
-            if cand != self.offset:
-                log.info(f"Broker-Serverzeit = UTC{cand / 3600:+.1f} h")
-            self.offset = cand
+        now = self.clock()
+        diff = newest - now
+        measured = round(diff / 1800) * 1800
+        if abs(diff - measured) > 300 or abs(measured) > 14 * 3600:
+            return  # Tick zu alt für eine sichere Messung
+        expected = self.srv.offset_at(now)
+        ok = measured == expected
+        if ok != self.clock_ok:
+            if ok:
+                log.info(f"Broker-Serverzeit geprüft: UTC{measured / 3600:+.1f} h passt zu SERVER_TZ = "
+                         f"'{self.srv.rule}'.")
+            else:
+                log.error(f"Broker-Serverzeit ist UTC{measured / 3600:+.1f} h, nach SERVER_TZ = '{self.srv.rule}' "
+                          f"wären es UTC{expected / 3600:+.1f} h. Bitte SERVER_TZ in mt5_config.py anpassen - "
+                          f"bis dahin keine neuen Orders.")
+        self.clock_ok = ok
 
     def get_bars(self, sym: str) -> pd.DataFrame | None:
-        """Geschlossene 5m-Kerzen der regulären US-Handelszeit, Zeit in UTC-Sekunden."""
-        if self.offset is None:
+        """Geschlossene 5m-Kerzen der regulären US-Handelszeit, Zeit in UTC-Sekunden.
+
+        'Geschlossen' entscheidet die Uhr des Brokers: eine Kerze zählt erst, wenn für dieses
+        Symbol ein Tick mit Zeitstempel ab ihrem Ende angekommen ist."""
+        tick = self.mt5.symbol_info_tick(sym)
+        if tick is None or not tick.time:
             return None
         rates = self.mt5.copy_rates_from_pos(sym, self.mt5.TIMEFRAME_M5, 0, C.BARS_HISTORY)
         if rates is None or len(rates) < 50:
             return None
+        rates = rates[rates["time"].astype("int64") + 300 <= int(tick.time)]
+        utc = self.srv.to_utc(rates["time"].astype("int64"))
+        keep = ~utc.isna()
+        t = ((utc[keep] - pd.Timestamp(0, tz="UTC")) // pd.Timedelta(seconds=1)).astype("int64")
         df = pd.DataFrame({
-            "t": rates["time"].astype("int64") - self.offset,
-            "o": rates["open"].astype(float), "h": rates["high"].astype(float),
-            "l": rates["low"].astype(float), "c": rates["close"].astype(float),
-            "v": rates["tick_volume"].astype("int64"),
+            "t": t.to_numpy(),
+            "o": rates["open"][keep].astype(float), "h": rates["high"][keep].astype(float),
+            "l": rates["low"][keep].astype(float), "c": rates["close"][keep].astype(float),
+            "v": rates["tick_volume"][keep].astype("int64"),
         })
-        df = df[df.t + 300 <= self.clock()]          # noch laufende Kerze weg
+        df = df[df.t + 300 <= self.clock() + 120]    # Plausibilität gegen die PC-Uhr
         df = data.add_session_cols(df)
         df = df[(df.mins >= data.SESSION_OPEN_MIN) & (df.mins < data.SESSION_CLOSE_MIN)]
         df = df.drop_duplicates("t").sort_values("t").reset_index(drop=True)
         return df if len(df) >= 50 else None
 
-    # ------------------------------------------------------------------ broker helpers
+    def flat_min(self, day: str) -> int:
+        """Minute (New York), zu der die Schluss-Kerze endet: flat_at, an halben Tagen 5 Min. vor Schluss."""
+        return min(self.flat_m, self.early[day] - 5) if day in self.early else self.flat_m
+
+    def close_min(self, day: str) -> int:
+        return self.early.get(day, data.SESSION_CLOSE_MIN)
+
+    def flat_utc(self, day: str) -> float:
+        return (pd.Timestamp(day, tz=data.NY) + pd.Timedelta(minutes=self.flat_min(day))).timestamp()
+
+    # ------------------------------------------------------------------ Broker-Helfer
     def my_positions(self, sym=None):
+        """Positionen dieses Bots - oder None, wenn die Abfrage fehlschlägt (dann nichts tun)."""
         res = self.mt5.positions_get(symbol=sym) if sym else self.mt5.positions_get()
-        return [p for p in (res or []) if p.magic == C.MAGIC_NUMBER]
+        return None if res is None else [p for p in res if p.magic == C.MAGIC_NUMBER]
 
     def my_orders(self, sym=None):
         res = self.mt5.orders_get(symbol=sym) if sym else self.mt5.orders_get()
-        return [o for o in (res or []) if o.magic == C.MAGIC_NUMBER]
+        return None if res is None else [o for o in res if o.magic == C.MAGIC_NUMBER]
 
     def fillings(self, info, pending=False):
         m = self.mt5
-        modes = []
-        if pending:
-            modes.append(m.ORDER_FILLING_RETURN)
+        modes = [m.ORDER_FILLING_RETURN] if pending else []
         fm = int(getattr(info, "filling_mode", 0) or 0)
         if fm & 1:
             modes.append(m.ORDER_FILLING_FOK)
@@ -243,7 +352,7 @@ class SmcBot:
             modes.append(m.ORDER_FILLING_IOC)
         if not pending:
             modes.append(m.ORDER_FILLING_RETURN)
-        return list(dict.fromkeys(modes)) or [m.ORDER_FILLING_RETURN]
+        return list(dict.fromkeys(modes))
 
     def send(self, request: dict, fillings):
         """Sendet eine Order. Nur bei 'falscher Füllart' wird mit der nächsten Füllart
@@ -263,8 +372,8 @@ class SmcBot:
         """Lotgröße über die Broker-Berechnung (order_calc_profit), immer abgerundet.
 
         Rückgabe: (lots, tatsächliches Risiko in Kontowährung) - oder ein Text mit dem
-        Grund, warum nicht gehandelt wird. Es wird nie MEHR als geplant riskiert; reicht
-        die Margin nicht für das volle Risiko, wird die Größe verkleinert.
+        Grund, warum nicht gehandelt wird. Reicht die Margin nicht für das volle Risiko,
+        wird die Größe verkleinert.
         """
         m = self.mt5
         acc = m.account_info()
@@ -307,21 +416,25 @@ class SmcBot:
 
     def close_position(self, pos, why: str) -> bool:
         m = self.mt5
-        info, tick = m.symbol_info(pos.symbol), m.symbol_info_tick(pos.symbol)
-        if info is None or tick is None:
-            log.error(f"{pos.symbol}: Position {pos.ticket} kann nicht geschlossen werden (keine Kurse).")
-            return False
+        info = m.symbol_info(pos.symbol)
         is_buy = pos.type == m.POSITION_TYPE_BUY
-        req = {"action": m.TRADE_ACTION_DEAL, "symbol": pos.symbol, "volume": pos.volume,
-               "type": m.ORDER_TYPE_SELL if is_buy else m.ORDER_TYPE_BUY, "position": pos.ticket,
-               "price": tick.bid if is_buy else tick.ask, "deviation": 50, "magic": C.MAGIC_NUMBER,
-               "comment": f"ADF {why}"[:31], "type_time": m.ORDER_TIME_GTC}
-        res = self.send(req, self.fillings(info))
-        if res is not None and res.retcode in (RET_DONE, RET_DONE_PARTIAL):
-            log.info(f"{pos.symbol}: Position {pos.ticket} geschlossen ({why}).")
-            return True
+        res = None
+        for _ in range(3):  # bei Requote/Preisänderung sofort mit frischem Kurs neu
+            tick = m.symbol_info_tick(pos.symbol)
+            if info is None or tick is None:
+                break
+            req = {"action": m.TRADE_ACTION_DEAL, "symbol": pos.symbol, "volume": pos.volume,
+                   "type": m.ORDER_TYPE_SELL if is_buy else m.ORDER_TYPE_BUY, "position": pos.ticket,
+                   "price": tick.bid if is_buy else tick.ask, "deviation": 100, "magic": C.MAGIC_NUMBER,
+                   "comment": f"ADF {why}"[:31], "type_time": m.ORDER_TIME_GTC}
+            res = self.send(req, self.fillings(info))
+            if res is not None and res.retcode in (RET_DONE, RET_DONE_PARTIAL):
+                log.info(f"{pos.symbol}: Position {pos.ticket} geschlossen ({why}).")
+                return True
+            if res is None or res.retcode not in RETRY_SAFE:
+                break
         log.error(f"{pos.symbol}: Schließen von {pos.ticket} FEHLGESCHLAGEN (Retcode "
-                  f"{res.retcode if res else m.last_error()}) - neuer Versuch in der nächsten Runde.")
+                  f"{res.retcode if res else m.last_error()}) - neuer Versuch folgt.")
         return False
 
     def cancel_order(self, order, why: str) -> bool:
@@ -331,108 +444,58 @@ class SmcBot:
         plan = self.state["plans"].get(str(order.ticket), {})
         if ok:
             log.info(f"{order.symbol}: Limit-Order {order.ticket} gelöscht ({why}).")
-            self.journal({"ereignis": "STORNO", "markt": plan.get("key", ""), "symbol": order.symbol,
-                          "richtung": plan.get("dir", ""), "entry": plan.get("entry", ""), "grund": why})
             plan["status"] = "storniert"
             self.save_state()
+            self.journal({"ereignis": "STORNO", "markt": plan.get("key", ""), "symbol": order.symbol,
+                          "richtung": plan.get("dir", ""), "entry": plan.get("entry", ""), "grund": why})
         else:
             log.error(f"{order.symbol}: Löschen von Order {order.ticket} fehlgeschlagen "
-                      f"({res.retcode if res else m.last_error()}).")
+                      f"({res.retcode if res else m.last_error()}) - neuer Versuch folgt.")
         return ok
 
-    # ------------------------------------------------------------------ daily guard
+    # ------------------------------------------------------------------ Wächter
     def daily_guard(self):
         acc = self.mt5.account_info()
         if acc is None:
             return
-        today = ny_now(self.clock()).strftime("%Y-%m-%d")
+        today = ny_ts(self.clock()).strftime("%Y-%m-%d")
         if self.state["day"] != today:
             self.state.update(day=today, day_equity=acc.equity, kill=False)
             self.save_state()
         limit = self.state["day_equity"] * (1 - C.DAILY_LOSS_LIMIT_PERCENT / 100)
-        if not self.state["kill"] and acc.equity <= limit:
+        if C.DAILY_LOSS_LIMIT_PERCENT > 0 and not self.state["kill"] and acc.equity <= limit:
             self.state["kill"] = True
             self.save_state()
             log.error(f"TAGESVERLUST-GRENZE erreicht (Kapital {acc.equity:.2f} <= {limit:.2f}). "
                       f"Heute keine neuen Orders mehr; wartende Limit-Orders werden gelöscht.")
-            for o in self.my_orders():
+            for o in self.my_orders() or []:
                 self.cancel_order(o, "Tagesverlust-Grenze")
 
     def flat_guard(self):
-        """Außerhalb von 09:30 bis flat_at (New York) hält der Bot nichts - unabhängig davon,
-        ob noch Kerzen kommen. Schlägt das Schließen fehl, alle 5 Minuten neuer Versuch."""
-        nyt = ny_now(self.clock())
-        mins = nyt.hour * 60 + nyt.minute
-        if nyt.weekday() < 5 and data.SESSION_OPEN_MIN <= mins < self.flat_m:
+        """Außerhalb von 09:30 bis zur Schluss-Kerze hält der Bot nichts - unabhängig davon, ob
+        noch Kerzen kommen. Bis zum Börsenschluss wird bei jedem Durchlauf neu versucht,
+        danach alle 5 Minuten."""
+        nyt = ny_ts(self.clock())
+        day, mins = nyt.strftime("%Y-%m-%d"), nyt.hour * 60 + nyt.minute
+        weekday = nyt.weekday() < 5
+        if weekday and data.SESSION_OPEN_MIN <= mins < self.flat_min(day):
             return
-        if self.clock() - self.last_flat_try < 300:
+        in_window = weekday and self.flat_min(day) <= mins < self.close_min(day)
+        if not in_window and self.clock() - self.last_flat_try < 300:
             return
         pos, ords = self.my_positions(), self.my_orders()
-        if not pos and not ords:
+        if pos is None or ords is None or (not pos and not ords):
             return
         self.last_flat_try = self.clock()
         for o in ords:
-            self.cancel_order(o, "außerhalb der Handelszeit")
+            self.cancel_order(o, "Sessionende")
         for p in pos:
             self.close_position(p, "Schluss")
-
-    # ------------------------------------------------------------------ fills, closes, protection
-    def track_positions(self):
-        m = self.mt5
-        current = {p.ticket: p for p in self.my_positions()}
-        for ticket, pos in current.items():
-            if ticket in self.known_positions:
-                continue
-            plan = self.state["plans"].get(str(pos.identifier), {})
-            self.known_positions[ticket] = {"symbol": pos.symbol, "plan_id": str(pos.identifier)}
-            if plan and plan.get("status") != "gefüllt":
-                plan["status"] = "gefüllt"
-                self.save_state()
-                log.info(f"⭐ EINSTIEG: {plan.get('dir', '').upper()} {pos.symbol} {pos.volume} @ {pos.price_open} "
-                         f"| SL {pos.sl} | TP {pos.tp}")
-                self.journal({"ereignis": "OPEN", "markt": plan.get("key"), "symbol": pos.symbol,
-                              "richtung": plan.get("dir"), "lots": pos.volume, "entry": pos.price_open,
-                              "sl": pos.sl, "tp": pos.tp, "risiko": f"{plan.get('risk_money', 0):.2f}",
-                              "setup": plan.get("chain", ""), "kapital": self.equity_txt()})
-        for ticket in [t for t in self.known_positions if t not in current]:
-            info = self.known_positions.pop(ticket)
-            self.journal_close(ticket, info)
-
-    def journal_close(self, ticket, info):
-        m = self.mt5
-        now = self.clock() + (self.offset or 0)
-        deals = None
-        try:
-            deals = m.history_deals_get(position=ticket)
-        except TypeError:
-            pass
-        if not deals:
-            deals = [d for d in (m.history_deals_get(datetime.fromtimestamp(now - 7 * 86400, timezone.utc),
-                                                     datetime.fromtimestamp(now + 86400, timezone.utc)) or [])
-                     if d.position_id == ticket]
-        outs = [d for d in deals if d.entry in (m.DEAL_ENTRY_OUT, m.DEAL_ENTRY_OUT_BY)]
-        if not outs:
-            return
-        profit = sum(d.profit for d in outs)
-        fees = sum(d.commission + d.swap + getattr(d, "fee", 0.0) for d in deals)
-        net = profit + fees
-        plan = self.state["plans"].get(info["plan_id"], {})
-        risk = plan.get("risk_money") or 0
-        r_txt = f"{net / risk:+.2f}" if risk else ""
-        reasons = {getattr(m, "DEAL_REASON_SL", 4): "Stop-Loss", getattr(m, "DEAL_REASON_TP", 5): "Take-Profit"}
-        why = reasons.get(getattr(outs[-1], "reason", -1), outs[-1].comment or "geschlossen")
-        log.info(f"{'🟢' if net >= 0 else '🔴'} GESCHLOSSEN: {info['symbol']} @ {outs[-1].price} | "
-                 f"{net:+.2f} ({r_txt}R) | {why}")
-        self.journal({"ereignis": "CLOSE", "markt": plan.get("key"), "symbol": info["symbol"],
-                      "richtung": plan.get("dir"), "exit": outs[-1].price, "gewinn": f"{net:.2f}",
-                      "r": r_txt, "gebuehren": f"{fees:.2f}", "grund": why, "kapital": self.equity_txt()})
-        plan["status"] = "geschlossen"
-        self.save_state()
 
     def guard_protection(self):
         """Jede Position MUSS SL und TP beim Broker haben."""
         m = self.mt5
-        for pos in self.my_positions():
+        for pos in self.my_positions() or []:
             if pos.sl > 0 and pos.tp > 0:
                 continue
             plan = self.state["plans"].get(str(pos.identifier), {})
@@ -446,58 +509,153 @@ class SmcBot:
             log.error(f"✖ {pos.symbol}: Position {pos.ticket} ungeschützt - wird geschlossen.")
             self.close_position(pos, "ohne SL/TP")
 
-    # ------------------------------------------------------------------ the strategy per symbol
+    # ------------------------------------------------------------------ Einstiege, Ausstiege, Journal
+    def journal_open(self, plan, symbol, volume, price, sl, tp):
+        log.info(f"⭐ EINSTIEG: {str(plan.get('dir', '')).upper()} {symbol} {volume} @ {price} | SL {sl} | TP {tp}")
+        self.journal({"ereignis": "OPEN", "markt": plan.get("key"), "symbol": symbol, "richtung": plan.get("dir"),
+                      "lots": volume, "entry": price, "sl": sl, "tp": tp,
+                      "risiko": f"{plan.get('risk_money', 0):.2f}", "setup": plan.get("chain", ""),
+                      "kapital": self.equity_txt()})
+
+    def track_positions(self):
+        current = self.my_positions()
+        if current is None:
+            return  # Abfrage fehlgeschlagen: NICHT als "alles geschlossen" deuten
+        current = {p.ticket: p for p in current}
+        for ticket, pos in current.items():
+            if ticket in self.known_positions:
+                continue
+            pid = str(pos.identifier)
+            self.known_positions[ticket] = {"symbol": pos.symbol, "plan_id": pid, "pos_id": pos.identifier}
+            plan = self.state["plans"].get(pid)
+            if plan and plan.get("status") != "gefüllt":
+                plan["status"] = "gefüllt"
+                self.save_state()
+                self.journal_open(plan, pos.symbol, pos.volume, pos.price_open, pos.sl, pos.tp)
+        for ticket in [t for t in self.known_positions if t not in current]:
+            self.pending_close[ticket] = [self.known_positions.pop(ticket), 0]
+
+    def process_pending_closes(self):
+        """Die Broker-Historie ist manchmal erst Sekunden später da -> bis zu 10 Versuche."""
+        for ticket, entry in list(self.pending_close.items()):
+            entry[1] += 1
+            if self.journal_close(entry[0]) or entry[1] >= 10:
+                del self.pending_close[ticket]
+
+    def reconcile_plans(self):
+        """Wartende Orders, die beim Broker verschwunden sind: zwischen zwei Durchläufen gefüllt
+        (und evtl. schon geschlossen) oder vom Broker verfallen lassen?"""
+        m = self.mt5
+        orders, positions = self.my_orders(), self.my_positions()
+        if orders is None or positions is None:
+            return
+        live = {o.ticket for o in orders} | {p.identifier for p in positions}
+        changed = False
+        for tk, plan in self.state["plans"].items():
+            if plan.get("status") != "wartet" or int(tk) in live:
+                continue
+            deals = m.history_deals_get(position=int(tk)) or ()
+            ins = [d for d in deals if d.entry == m.DEAL_ENTRY_IN]
+            if ins:
+                plan["status"], changed = "gefüllt", True
+                self.journal_open(plan, plan.get("symbol"), ins[0].volume, ins[0].price, plan.get("sl"), plan.get("tp"))
+                self.pending_close[int(tk)] = [{"symbol": plan.get("symbol"), "plan_id": tk, "pos_id": int(tk)}, 0]
+                continue
+            hist = m.history_orders_get(ticket=int(tk)) if hasattr(m, "history_orders_get") else None
+            state = getattr(hist[0], "state", None) if hist else None
+            if state in (ORDER_STATE_CANCELED, ORDER_STATE_REJECTED, ORDER_STATE_EXPIRED):
+                plan["status"], changed = "storniert", True
+                self.journal({"ereignis": "ABGELAUFEN", "markt": plan.get("key"), "symbol": plan.get("symbol"),
+                              "richtung": plan.get("dir"), "entry": plan.get("entry"),
+                              "grund": "beim Broker verfallen/gelöscht"})
+            else:
+                plan["tries"] = plan.get("tries", 0) + 1
+                if plan["tries"] >= 10:
+                    plan["status"] = "unbekannt"
+                changed = True
+        if changed:
+            self.save_state()
+
+    def journal_close(self, info) -> bool:
+        m = self.mt5
+        deals = m.history_deals_get(position=info["pos_id"]) or ()
+        outs = [d for d in deals if d.entry in (m.DEAL_ENTRY_OUT, m.DEAL_ENTRY_OUT_BY)]
+        if not outs:
+            return False
+        profit = sum(d.profit for d in outs)
+        fees = sum(d.commission + d.swap + getattr(d, "fee", 0.0) for d in deals)
+        net = profit + fees
+        plan = self.state["plans"].get(info["plan_id"], {})
+        risk = plan.get("risk_money") or 0
+        r_txt = f"{net / risk:+.2f}" if risk else ""
+        reasons = {getattr(m, "DEAL_REASON_SL", 4): "Stop-Loss", getattr(m, "DEAL_REASON_TP", 5): "Take-Profit"}
+        why = reasons.get(getattr(outs[-1], "reason", -1), outs[-1].comment or "geschlossen")
+        log.info(f"{'🟢' if net >= 0 else '🔴'} GESCHLOSSEN: {info['symbol']} @ {outs[-1].price} | "
+                 f"{net:+.2f} ({r_txt}R) | {why}")
+        self.journal({"ereignis": "CLOSE", "markt": plan.get("key"), "symbol": info["symbol"],
+                      "richtung": plan.get("dir"), "exit": outs[-1].price, "gewinn": f"{net:.2f}",
+                      "r": r_txt, "gebuehren": f"{fees:.2f}", "grund": why, "kapital": self.equity_txt()})
+        if plan:
+            plan["status"] = "geschlossen"
+            self.save_state()
+        return True
+
+    # ------------------------------------------------------------------ Strategie pro Aktie
+    def cancel_dropped(self, key, orders):
+        """Limit-Orders löschen, deren Setup die Engine nicht mehr hält (oder die zu alt sind)."""
+        max_age = (self.eng["entry_window"] + 2) * 300
+        held = self.held.get(key, set())
+        for o in orders:
+            plan = self.state["plans"].get(str(o.ticket), {})
+            armed = plan.get("armed_t")
+            too_old = self.clock() - plan.get("placed_utc", self.clock()) > max_age
+            if armed not in held or too_old:
+                why = "zu alt" if armed in held else self.dropped.get((key, armed), "Setup nicht mehr gültig")
+                self.cancel_order(o, why)
+
     def process_symbol(self, key: str, sym: str):
         df = self.get_bars(sym)
         if df is None:
             return
         newest = int(df.t.iloc[-1])
         prev = self.last_bar.get(key)
+        live_pos, live_ord = self.my_positions(sym), self.my_orders(sym)
+        if live_pos is None or live_ord is None:
+            return  # Abfrage fehlgeschlagen -> im nächsten Durchlauf erneut
         if prev == newest:
+            if key in self.held and live_ord:
+                self.cancel_dropped(key, live_ord)   # fehlgeschlagene Löschungen sofort wiederholen
             return
         self.last_bar[key] = newest
         first = prev is None
-        flat = int(df.mins.iloc[-1]) + 5 >= self.flat_m
-
-        live_pos, live_ord = self.my_positions(sym), self.my_orders(sym)
-        if flat:
+        day = df.day.iloc[-1]
+        if int(df.mins.iloc[-1]) + 5 >= self.flat_min(day):
             for o in live_ord:
                 self.cancel_order(o, "Sessionende")
             for p in live_pos:
                 self.close_position(p, "Schluss")
+            self.held[key] = set()
             self.status[key] = "Schluss - glattgestellt"
             return
 
         res = analyze(df, key, self.cfg, open_end=True)
         st = res["state"]
         eng_ord = st.get("order")
+        # Setups, die die Engine noch hält: wartende Order oder (simulierte) offene Position
+        self.held[key] = {x["armed_t"] for x in (st.get("order"), st.get("pos")) if x}
+        for r in res["refusals"]:
+            if r.get("armed_t"):
+                self.dropped[(key, r["armed_t"])] = r["reason"]
         self.status[key] = ("im Trade" if live_pos else "Limit aktiv" if live_ord else
                             "Sweep - warte auf MSS" if st.get("cand") else "beobachte")
-
-        # 1) Limit-Orders löschen, die die Engine nicht mehr hält
-        max_age = (self.eng["entry_window"] + 2) * 300
-        for o in live_ord:
-            plan = self.state["plans"].get(str(o.ticket), {})
-            same = eng_ord is not None and plan.get("armed_t") == eng_ord["armed_t"]
-            too_old = self.clock() - plan.get("placed_utc", self.clock()) > max_age
-            if not same or too_old:
-                why = "zu alt" if same else self.why_dropped(res, plan.get("armed_t"))
-                self.cancel_order(o, why)
-
-        # 2) neues Setup genau auf dieser Kerze -> Limit-Order
+        self.cancel_dropped(key, live_ord)
         if first or eng_ord is None or eng_ord["armed_t"] != newest:
             return
-        self.try_place(key, sym, eng_ord)
+        if any(p.get("armed_t") == newest and p.get("key") == key for p in self.state["plans"].values()):
+            return  # dieses Setup wurde schon platziert
+        self.try_place(key, sym, eng_ord, day)
 
-    def why_dropped(self, res, armed_t):
-        for r in res["refusals"]:
-            if r.get("armed_t") == armed_t:
-                return r["reason"]
-        if any(t.get("armed_t") == armed_t for t in res["trades"]):
-            return "in der Simulation gefüllt, beim Broker nicht"
-        return "Setup nicht mehr gültig"
-
-    def try_place(self, key, sym, o):
+    def try_place(self, key, sym, o, day):
         m = self.mt5
         long = o["dir"] == "long"
         chain = (f"Sweep {o['sweep_lb']} {o['sweep_p']} -> {o['mss_k'].upper()} {o['mss_p']} -> "
@@ -511,16 +669,21 @@ class SmcBot:
 
         if not self.trading_ok:
             return skip("Algo-Handel im Terminal aus")
+        if self.clock_ok is not True:
+            return skip("Broker-Serverzeit nicht bestätigt (SERVER_TZ prüfen)")
         if self.state.get("kill"):
             return skip("Tagesverlust-Grenze erreicht")
-        if self.my_positions(sym) or self.my_orders(sym):
+        pos_s, ord_s, pos_all, ord_all = self.my_positions(sym), self.my_orders(sym), self.my_positions(), self.my_orders()
+        if any(x is None for x in (pos_s, ord_s, pos_all, ord_all)):
+            return skip("Positionsabfrage beim Broker fehlgeschlagen")
+        if pos_s or ord_s:
             return skip("schon Position/Order in dieser Aktie")
-        if len(self.my_positions()) + len(self.my_orders()) >= C.MAX_OPEN_POSITIONS:
+        if len(pos_all) + len(ord_all) >= C.MAX_OPEN_POSITIONS:
             return skip(f"max. {C.MAX_OPEN_POSITIONS} Positionen/Orders erreicht")
         info, tick = m.symbol_info(sym), m.symbol_info_tick(sym)
         if info is None or tick is None or not tick.bid or not tick.ask:
             return skip("keine aktuellen Kurse")
-        tm = getattr(info, "trade_mode", 4)
+        tm = getattr(info, "trade_mode", 4)  # 0 aus, 1 nur Long, 2 nur Short, 3 nur Schließen, 4 voll
         if tm in (0, 3) or (tm == 1 and not long) or (tm == 2 and long):
             return skip("Handel in dieser Richtung beim Broker nicht erlaubt")
 
@@ -536,6 +699,18 @@ class SmcBot:
             return skip(f"Kurs (Ask {tick.ask}) schon in der Zone oder Abstände unter Broker-Minimum")
         if not long and not (entry > tick.bid + gap and sl > entry + gap and tp < entry - gap):
             return skip(f"Kurs (Bid {tick.bid}) schon in der Zone oder Abstände unter Broker-Minimum")
+
+        # Ablauf beim Broker: so lange, wie die Engine auf den Retest wartet, höchstens bis zum Schluss
+        end_utc = min(o["armed_t"] + (self.eng["entry_window"] + 1) * 300, self.flat_utc(day))
+        em = int(getattr(info, "expiration_mode", 0) or 0)
+        if em & EXP_SPECIFIED:
+            timing = {"type_time": m.ORDER_TIME_SPECIFIED, "expiration": int(end_utc + self.srv.offset_at(end_utc))}
+        elif em & EXP_DAY:
+            timing = {"type_time": m.ORDER_TIME_DAY}
+        else:
+            timing = {"type_time": m.ORDER_TIME_GTC}
+            log.warning(f"{sym}: Broker erlaubt keinen Order-Verfall - die Order verfällt nicht von selbst.")
+
         sized = self.calc_lots(sym, info, long, entry, sl)
         if isinstance(sized, str):
             return skip(sized)
@@ -544,7 +719,7 @@ class SmcBot:
         req = {"action": m.TRADE_ACTION_PENDING, "symbol": sym, "volume": lots,
                "type": m.ORDER_TYPE_BUY_LIMIT if long else m.ORDER_TYPE_SELL_LIMIT,
                "price": entry, "sl": sl, "tp": tp, "magic": C.MAGIC_NUMBER,
-               "comment": f"ADF {o['armed_t']}"[:31], "type_time": m.ORDER_TIME_GTC}
+               "comment": f"ADF {o['armed_t']}"[:31], **timing}
         res = self.send(req, self.fillings(info, pending=True))
         if res is None or res.retcode not in OK_RETCODES:
             return skip(f"Broker hat abgelehnt (Retcode {res.retcode if res else m.last_error()})")
@@ -554,7 +729,8 @@ class SmcBot:
             "placed_utc": self.clock(), "status": "wartet"}
         self.prune_plans()
         self.save_state()
-        log.info(f"★ {head}: Limit {lots} @ {entry} | SL {sl} | TP {tp} | Risiko {risk_money:.2f}")
+        log.info(f"★ {head}: Limit {lots} @ {entry} | SL {sl} | TP {tp} | Risiko {risk_money:.2f} | "
+                 f"verfällt {ny_ts(end_utc):%H:%M} NY")
         self.journal({"ereignis": "ORDER", "markt": key, "symbol": sym, "richtung": o["dir"], "lots": lots,
                       "entry": entry, "sl": sl, "tp": tp, "risiko": f"{risk_money:.2f}", "setup": chain,
                       "kapital": self.equity_txt()})
@@ -562,11 +738,11 @@ class SmcBot:
     def prune_plans(self, keep_days=14):
         cutoff = self.clock() - keep_days * 86400
         plans = self.state["plans"]
-        for k in [k for k, v in plans.items() if v.get("status") in ("geschlossen", "storniert")
+        for k in [k for k, v in plans.items() if v.get("status") in ("geschlossen", "storniert", "unbekannt")
                   and v.get("placed_utc", 0) < cutoff]:
             del plans[k]
 
-    # ------------------------------------------------------------------ loop
+    # ------------------------------------------------------------------ Schleife
     def equity_txt(self):
         acc = self.mt5.account_info()
         return f"{acc.equity:.2f}" if acc else ""
@@ -577,42 +753,67 @@ class SmcBot:
         self.last_heartbeat = self.clock()
         acc = self.mt5.account_info()
         eq = f"Kapital {acc.equity:.2f} {acc.currency}" if acc else "Kapital ?"
-        log.info(f"♥ {ny_now(self.clock()):%H:%M} New York - {eq}, {len(self.my_positions())} Position(en), "
-                 f"{len(self.my_orders())} Limit-Order(s){' - TAGESGRENZE AKTIV' if self.state.get('kill') else ''}")
+        log.info(f"♥ {ny_ts(self.clock()):%H:%M} New York - {eq}, {len(self.my_positions() or [])} Position(en), "
+                 f"{len(self.my_orders() or [])} Limit-Order(s){' - TAGESGRENZE AKTIV' if self.state.get('kill') else ''}"
+                 f"{'' if self.clock_ok else ' - SERVERZEIT NICHT BESTÄTIGT'}")
         for key in self.symbols:
             log.info(f"   {key:<6} {self.status.get(key, 'warte auf Daten / Markt geschlossen')}")
 
     def step(self):
         if not self.ensure_connection():
             return
-        self.update_offset()
-        self.track_positions()
-        self.guard_protection()
-        self.daily_guard()
-        self.flat_guard()
+        # jeder Teil einzeln abgesichert: ein Fehler darf Schutz und Glattstellen nicht verhindern
+        for part in (self.check_clock, self.track_positions, self.process_pending_closes, self.reconcile_plans,
+                     self.guard_protection, self.daily_guard, self.flat_guard):
+            try:
+                part()
+            except Exception:
+                log.exception(f"Fehler in {part.__name__}")
         for key, sym in self.symbols.items():
             try:
                 self.process_symbol(key, sym)
-            except Exception:  # ein Markt darf den Bot nicht stoppen
+            except Exception:
                 log.exception(f"{key}: Fehler bei der Verarbeitung")
-        self.heartbeat()
+        try:
+            self.heartbeat()
+        except Exception:
+            log.exception("Fehler im Herzschlag")
+
+    def acquire_lock(self):
+        """Nur eine Instanz pro Ordner: zwei Bots würden sich gegenseitig Orders löschen."""
+        self._lock_fd = os.open(self.path("bot_smc.lock"), os.O_RDWR | os.O_CREAT)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self._lock_fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log.error("Der Bot läuft bereits (zweites Fenster offen?) - Abbruch.")
+            sys.exit(1)
 
     def run(self):
         log.info("=" * 64)
         log.info("Aktien Data Farm - MT5-Autopilot (SMC-Engine) startet")
         log.info(f"Strategie aus config.json: RR {self.eng['target_rr']}, Einstiege "
                  f"{self.eng['no_entry_before']}-{self.eng['no_entry_after']} NY, glatt um {self.eng.get('flat_at')} NY, "
-                 f"Risiko {C.RISK_PERCENT}%/Trade, Tagesgrenze -{C.DAILY_LOSS_LIMIT_PERCENT}%")
+                 f"Risiko {C.RISK_PERCENT}%/Trade, Tagesgrenze -{C.DAILY_LOSS_LIMIT_PERCENT}%, "
+                 f"Serverzeit-Regel '{C.SERVER_TZ}'")
+        self.acquire_lock()
         self.connect()
-        self.known_positions = {p.ticket: {"symbol": p.symbol, "plan_id": str(p.identifier)}
-                                for p in self.my_positions()}
+        self.known_positions = {p.ticket: {"symbol": p.symbol, "plan_id": str(p.identifier), "pos_id": p.identifier}
+                                for p in self.my_positions() or []}
         log.info("Warte auf neue Kerzen ... (Stopp: Strg + C - SL/TP bleiben beim Broker aktiv)")
         try:
             while True:
-                self.step()
+                try:
+                    self.step()
+                except Exception:
+                    log.exception("Unerwarteter Fehler - der Bot läuft weiter")
                 time.sleep(C.POLL_SECONDS)
         except KeyboardInterrupt:
-            for o in self.my_orders():  # ohne Bot würde niemand sie rechtzeitig löschen
+            for o in self.my_orders() or []:  # ohne Bot würde niemand sie rechtzeitig löschen
                 self.cancel_order(o, "Bot gestoppt")
             log.info("Bot gestoppt. Wartende Limit-Orders wurden gelöscht. Offene Positionen sind durch "
                      "SL/TP beim Broker gesichert - aber ohne Bot werden sie NICHT zum Schluss glattgestellt!")
@@ -620,8 +821,24 @@ class SmcBot:
             self.mt5.shutdown()
 
 
+def disable_quickedit():
+    """Windows: ein Klick ins Konsolenfenster (QuickEdit) würde den Bot anhalten."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.GetStdHandle(-10)
+        mode = ctypes.c_uint()
+        if k.GetConsoleMode(h, ctypes.byref(mode)):
+            k.SetConsoleMode(h, (mode.value & ~0x0040) | 0x0080)
+    except Exception:
+        pass
+
+
 def main():
     setup_logging()
+    disable_quickedit()
     try:
         import MetaTrader5 as mt5
     except ImportError:

@@ -49,6 +49,8 @@ def run_engine(df, events, atr_arr, sym, cfg, costs, bias=None, open_end=False, 
     first_m, last_m = hhmm(cfg["no_entry_before"]), hhmm(cfg["no_entry_after"])
     flat_m = hhmm(cfg.get("flat_at", "16:00"))
     bar_min = 5
+    # early-close days (e.g. 13:00): flat with the bar that ends 5 minutes before the close
+    early = {d: hhmm(v) - bar_min for d, v in (cfg.get("early_close") or {}).items()}
 
     by_i = {}
     for e in events:
@@ -140,7 +142,7 @@ def run_engine(df, events, atr_arr, sym, cfg, costs, bias=None, open_end=False, 
     for i in range(n):
         # session end: last bar of the day, or the bar that ends at/after flat_at
         last_bar = (i == n - 1 and not open_end) or (i < n - 1 and day[i + 1] != day[i]) \
-            or mins[i] + bar_min >= flat_m
+            or mins[i] + bar_min >= min(flat_m, early.get(day[i], flat_m))
 
         # 1) manage the open position (from the bar after the fill)
         pos = st["pos"]
