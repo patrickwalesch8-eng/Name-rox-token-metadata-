@@ -19,6 +19,8 @@ MAGIC_NUMBER = 200002        # Kennung der Orders dieses Bots (anders als beim T
 MT5_LOGIN = None             # z.B. 12345678 (Demo-Kontonummer)
 MT5_PASSWORD = None
 MT5_SERVER = None            # z.B. "MetaQuotes-Demo"
+# Nur nötig, wenn mehrere MetaTrader 5 installiert sind: welches Terminal der Bot nimmt
+MT5_PATH = None              # z.B. r"C:\Program Files\MetaTrader 5\terminal64.exe"
 
 # --- Märkte: Name in der Farm -> Symbolname bei DEINEM Broker ---
 # Jeder Broker benennt Aktien-CFDs anders, z.B. "NVDA", "NVDA.US", "#NVDA",

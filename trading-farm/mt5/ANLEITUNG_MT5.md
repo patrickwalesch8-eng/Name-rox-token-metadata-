@@ -31,8 +31,15 @@ Das Sicherheitskonzept stammt von deinem Trend-Bot und wurde erweitert.
 
 1. MT5 öffnen und mit dem **Demokonto** einloggen.
 2. Oben den Knopf **„Algo Trading“** einschalten, sodass er grün ist.
+   Unter **Extras → Optionen → Expert Advisors** muss außerdem gelten:
+   - Haken bei **„Algorithmischen Handel erlauben“** gesetzt
+   - **kein** Haken bei der Option, die den Algo-Handel **über die externe Python-API deaktiviert**.
+     Ist sie an, darf der Bot Kurse lesen, aber keine Orders senden (Retcode 10027).
 3. Im Ordner `trading-farm/mt5` die Datei **`start_mt5_bot.bat` doppelklicken**.
    Beim ersten Mal wird alles installiert.
+4. Nach dem Verbinden muss im Fenster stehen: **„Handel über die MT5-Python-API ist erlaubt.“**
+   Steht dort **„KEIN HANDEL: …“**, nennt die Zeile den Grund und was zu tun ist. Eine Änderung
+   im MT5 bemerkt der Bot von selbst, ein Neustart ist nicht nötig.
 
 Gestoppt wird mit **Strg + C**. Dabei werden wartende Limit-Orders gelöscht.
 Offene Positionen behalten ihren Stop-Loss und Take-Profit beim Broker, werden ohne laufenden
@@ -72,7 +79,7 @@ Bei jeder neuen 5-Minuten-Kerze in der regulären US-Handelszeit:
 | Fehler | Ein einzelner Fehler (z.B. Journal in Excel geöffnet) stoppt den Bot nicht. Journal-Zeilen werden später nachgetragen. |
 | Nur einmal starten | Ein zweites Bot-Fenster im selben Ordner bricht sofort ab. |
 | Spread-Filter | Kein Trade, wenn der Spread mehr als 20 % des Stop-Abstands ausmacht. |
-| Algo-Handel aus | Keine neuen Orders, solange der Knopf im Terminal aus ist. |
+| Handel gesperrt | Keine neuen Orders, solange „Algo Trading“ aus ist, die Python-API im MT5 gesperrt ist, mit dem Investor-Passwort (nur Lesen) eingeloggt ist oder der Broker keinen Automatik-Handel erlaubt. Der Grund steht im Fenster. |
 | Verbindung weg | Der Bot verbindet sich automatisch neu. |
 | Neustart | Der Zustand liegt in `bot_smc_state.json`. Alte Signale werden nicht nachgehandelt. Was der Broker ausgeführt hat, während der Bot aus war (Order gefüllt, SL/TP getroffen), wird im Journal nachgetragen. |
 
@@ -92,8 +99,9 @@ Kennung (`MAGIC_NUMBER = 200002`) und fasst die Trades des anderen Bots nicht an
 |---|---|
 | `MetaTrader5-Paket fehlt` / Installation schlägt fehl | Python 3.12 installieren und `start_mt5_bot.bat` erneut starten |
 | `Symbol 'NVDA' beim Broker nicht gefunden` | Den vorgeschlagenen Namen in `mt5_config.py` → `MARKETS` eintragen |
-| `Algo-Handel ist im MT5-Terminal AUS` | Den Knopf „Algo Trading“ oben im MT5 einschalten |
-| `Broker hat abgelehnt (Retcode …)` | Die Nummer im MT5-Journal nachsehen oder mir schicken |
+| `MT5-Initialisierung fehlgeschlagen` | MT5 starten und einloggen. Bot und MT5 beide normal starten, nicht eins davon „Als Administrator“. Sind mehrere MT5 installiert, in `mt5_config.py` bei `MT5_PATH` den Pfad zur richtigen `terminal64.exe` eintragen. |
+| `KEIN HANDEL: …` | Die Zeile sagt, was zu tun ist: „Algo Trading“ einschalten, den Haken für die Python-API-Sperre entfernen (Schritt 2 unter „Starten“) oder mit dem normalen statt dem Investor-Passwort einloggen. |
+| `Order abgelehnt (Retcode …)` | Hinter der Nummer steht der Grund, z.B. „Markt geschlossen“. Steht keiner dabei, die Nummer im MT5-Journal nachsehen oder mir schicken. |
 | `Die PC-Uhr geht … s vor/nach` | Windows: Einstellungen → Zeit und Sprache → Datum und Uhrzeit → „Jetzt synchronisieren“. Der Bot merkt es selbst, wenn die Uhr wieder stimmt. |
 | `Broker erlaubt keine Ablaufzeit für Limit-Orders` | Bei diesem Broker verfallen Limit-Orders nicht von selbst. Der Bot handelt dort nicht, weil eine Order sonst nach einem Absturz noch nach Börsenschluss gefüllt werden könnte. Ein anderer Broker bzw. anderes Demokonto ist nötig. |
-| Es kommen keine Orders | Das ist normal, die Strategie ist sehr wählerisch. Die Gründe stehen als `SKIP` im Journal, und im Dashboard siehst du, warum die Engine Setups ablehnt. |
+| Es kommen keine Orders | Das ist normal, die Strategie ist sehr wählerisch: Im Backtest mit echten Kursen gab es bei 5 Aktien **20 Trades in 60 Tagen**, also nur alle paar Tage einen. Orders kommen nur von 15:45 bis 21:30 Uhr deutscher Zeit. Außerhalb steht im Status „warte auf Daten / Markt geschlossen“. Die Gründe für ausgelassene Setups stehen als `SKIP` im Journal, und im Dashboard siehst du, warum die Engine Setups ablehnt. |
