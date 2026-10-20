@@ -110,6 +110,24 @@ Stand der TradingView-Webseite am 12.10.2026, bitte im eigenen Konto prüfen:
 - **Webhooks** (Meldungen automatisch an andere Programme schicken) gibt es ab Essential.
   Dafür muss die Zwei-Faktor-Anmeldung aktiv sein.
 
+### Mit Essential (kleinstes bezahltes Abo)
+
+Für dieses Script reicht Essential. Es gibt nur drei Dinge zu beachten:
+
+- **Alarme:** Die 5 Standard-Aktien (SPY, QQQ, AAPL, NVDA, TSLA) brauchen 5 von deinen
+  20 Alarmen. Bis zu 20 Aktien gehen also gleichzeitig.
+- **Ablauf nach 2 Monaten:** Beim Anlegen das späteste mögliche Ablaufdatum wählen und
+  einen Tag vorher eine Erinnerung in den Handy-Kalender eintragen. Dann im
+  Alarm-Manager jeden Alarm bearbeiten und ein neues Datum setzen, oder ihn neu anlegen.
+  Ein abgelaufener Alarm meldet nichts mehr, ohne dass du es merkst.
+- **Backtest-Länge:** Essential lädt 10.000 Kerzen. Auf 5 Minuten mit regulärer
+  Handelszeit (78 Kerzen pro Tag) sind das etwa 128 Handelstage, also rund **6 Monate**.
+  Der Strategietester rechnet nur über diesen Zeitraum. Längere Tests
+  („Deep Backtesting“) gibt es erst ab Premium.
+
+Ein Indikator pro Chart, 1h-Trend über `request.security` und die Push-Meldungen in der App
+funktionieren mit Essential ohne Einschränkung.
+
 ## 5. Unterschiede zur Python-Farm
 
 Die Logik ist dieselbe wie in `trading-farm/farmlib`. Ein paar Dinge rechnet TradingView aber anders:
