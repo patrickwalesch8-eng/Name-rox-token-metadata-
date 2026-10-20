@@ -41,13 +41,22 @@ jobs:
           git config user.email "trading-farm-bot@users.noreply.github.com"
           git add data/raw
           git diff --cached --quiet || (git commit -m "farm: Daten $(date -u +%F)" && git push)
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - name: GitHub Pages pruefen
+        id: pages
+        continue-on-error: true   # solange Pages aus ist: Lauf bleibt gruen, nur ohne Webseite
+        uses: actions/configure-pages@v5
+      - if: steps.pages.outcome == 'success'
+        uses: actions/upload-pages-artifact@v3
         with:
           path: trading-farm/site
+      - if: steps.pages.outcome != 'success'
+        run: echo "::warning::GitHub Pages ist noch aus. Einschalten unter Settings -> Pages -> Source -> GitHub Actions"
+    outputs:
+      pages: ${{ steps.pages.outcome }}
 
   deploy:
     needs: build
+    if: needs.build.outputs.pages == 'success'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

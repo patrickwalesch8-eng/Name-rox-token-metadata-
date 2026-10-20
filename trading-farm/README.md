@@ -38,11 +38,14 @@ die neuen Tage an die gespeicherten an (`data/raw/`), sodass die Historie mit de
 
 ## Am Handy ansehen
 
-Das Dashboard kann sich automatisch jeden Abend nach US-Börsenschluss aktualisieren
-und auf einer Webseite erscheinen. Dafür sind einmalig zwei Schritte nötig:
+Das Dashboard aktualisiert sich automatisch Mo–Fr um 21:30 UTC, also nach US-Börsenschluss
+(23:30 Uhr deutscher Sommerzeit, 22:30 Uhr Winterzeit), und erscheint auf einer Webseite.
+Dafür ist einmalig ein Schritt nötig:
 
-1. Den Branch mit diesem Code in `main` mergen, denn GitHub führt geplante Abläufe nur dort aus.
-2. Auf GitHub unter **Settings → Pages → Source** die Option **„GitHub Actions“** wählen.
+- Auf GitHub unter **Settings → Pages → Source** die Option **„GitHub Actions“** wählen.
+
+Solange das fehlt, lädt der Ablauf trotzdem jeden Abend die Kurse und speichert sie.
+Er zeigt dann nur eine gelbe Warnung und veröffentlicht keine Webseite.
 
 Danach unter **Actions → Trading Farm → Run workflow** einmal manuell starten.
 Das Dashboard erscheint dann unter
