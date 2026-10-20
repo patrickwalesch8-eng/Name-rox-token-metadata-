@@ -172,6 +172,40 @@ class Safety(unittest.TestCase):
         fake.login = 123
         self.assertTrue(bot.ensure_connection())
 
+    def test_trading_blocks_are_reported_and_lifted(self):
+        fake, bot = self.bot()
+        bot.connect()
+        self.confirm_clock(fake, bot)
+        for attr, value, hint in (("tradeapi_disabled", True, "Python-API"),
+                                  ("trade_allowed", False, "Algo Trading"),
+                                  ("account_trade_allowed", False, "Investor-Passwort")):
+            setattr(fake, attr, value)
+            with self.assertLogs("bot_smc", "ERROR") as logs:
+                self.assertTrue(bot.ensure_connection())
+            self.assertIn(hint, "\n".join(logs.output))
+            self.assertFalse(bot.trading_ok)
+            n = len(fake.sent)
+            bot.try_place("TST", "TST.US", self.plan_for_try(), "2026-10-14")
+            self.assertEqual(len(fake.sent), n)
+            setattr(fake, attr, not value)
+            with self.assertLogs("bot_smc", "INFO") as logs:
+                bot.ensure_connection()
+            self.assertIn("ist erlaubt", "\n".join(logs.output))
+            self.assertTrue(bot.trading_ok)
+        self.assertIn("Investor-Passwort", (Path(self.tmp.name) / C.JOURNAL_FILE).read_text(encoding="utf-8"))
+
+    def test_rejection_shows_the_reason(self):
+        fake, bot = self.bot()
+        bot.connect()
+        self.confirm_clock(fake, bot)
+        bot.ensure_connection()
+        fake.tradeapi_disabled = True          # set after the check: the order itself gets 10027
+        price = fake.symbol_info_tick("TST.US").bid
+        plan = dict(self.plan_for_try(), entry=price - 1, sl=price - 2, tp=price + 1)
+        bot.try_place("TST", "TST.US", plan, "2026-10-14")
+        self.assertTrue(fake.sent)
+        self.assertIn("Retcode 10027: Algo-Handel", (Path(self.tmp.name) / C.JOURNAL_FILE).read_text(encoding="utf-8"))
+
     def test_no_retry_after_partial_fill(self):
         fake, bot = self.bot()
         calls = []

@@ -62,6 +62,25 @@ RETRY_SAFE = (RET_REQUOTE, RET_PRICE_CHANGED, RET_PRICE_OFF, RET_TOO_MANY, RET_C
 EXP_GTC, EXP_DAY, EXP_SPECIFIED = 1, 2, 4
 ORDER_STATE_CANCELED, ORDER_STATE_REJECTED, ORDER_STATE_EXPIRED = 2, 5, 6
 MAX_CLOCK_SKEW = 60   # so viele Sekunden darf die PC-Uhr von der Broker-Uhr abweichen
+# Ablehnungen, die man selbst beheben kann - im Log als Text statt nur als Zahl
+RETCODE_TEXT = {
+    10006: "vom Broker abgelehnt", 10013: "ungültige Anfrage", 10014: "ungültige Lotgröße",
+    10015: "ungültiger Preis", 10016: "SL/TP ungültig oder zu nah am Kurs",
+    10017: "Handel in diesem Symbol gesperrt", 10018: "Markt geschlossen",
+    10019: "nicht genug freie Margin", 10022: "ungültige Ablaufzeit",
+    10026: "Broker erlaubt auf diesem Konto keinen Automatik-Handel",
+    10027: "Algo-Handel im MT5 aus oder für Python gesperrt (ANLEITUNG_MT5.md, Schritt 2)",
+    10030: "Füllart vom Broker nicht unterstützt", 10031: "keine Verbindung zum Handelsserver",
+    10033: "zu viele wartende Orders", 10040: "zu viele offene Positionen",
+    10042: "nur Long erlaubt", 10043: "nur Short erlaubt", 10044: "nur Schließen erlaubt",
+}
+
+
+def failure_text(res, mt5) -> str:
+    if res is None:
+        return f"keine Antwort vom Terminal ({mt5.last_error()})"
+    txt = RETCODE_TEXT.get(res.retcode)
+    return f"Retcode {res.retcode}" + (f": {txt}" if txt else "")
 
 
 def setup_logging():
@@ -139,6 +158,7 @@ class SmcBot:
         self.last_tick = None                   # neuester Tick der letzten Uhrprüfung
         self.account_ok = True
         self.trading_ok = True
+        self.trade_block_msg = ""               # None = Handel erlaubt; "" = noch nicht geprüft
         self.known_positions: dict[int, dict] = {}
         self.pending_close: dict[int, list] = {}
         self.journal_backlog: list[dict] = []
@@ -192,15 +212,17 @@ class SmcBot:
 
     # ------------------------------------------------------------------ Verbindung / Konto
     def init_kwargs(self):
+        kw = {"path": C.MT5_PATH} if getattr(C, "MT5_PATH", None) else {}
         if C.MT5_LOGIN:
-            return dict(login=C.MT5_LOGIN, password=C.MT5_PASSWORD, server=C.MT5_SERVER)
-        return {}
+            kw.update(login=C.MT5_LOGIN, password=C.MT5_PASSWORD, server=C.MT5_SERVER)
+        return kw
 
     def connect(self):
         m = self.mt5
         if not m.initialize(**self.init_kwargs()):
             log.error(f"MT5-Initialisierung fehlgeschlagen: {m.last_error()}")
-            log.error("Ist das MT5-Terminal gestartet und eingeloggt?")
+            log.error("Prüfen: MT5 gestartet und eingeloggt? Bot und MT5 beide normal gestartet (nicht eins "
+                      "davon 'Als Administrator')? Mehrere MT5 installiert? Dann MT5_PATH in mt5_config.py setzen.")
             sys.exit(1)
         acc = m.account_info()
         if acc is None:
@@ -240,16 +262,32 @@ class SmcBot:
         self.account_ok = ok
         if not ok:
             return False
-        term = m.terminal_info()
-        allowed = bool(getattr(term, "trade_allowed", True)) if term is not None else False
-        if allowed != self.trading_ok:
-            if allowed:
-                log.info("Algo-Handel im Terminal ist wieder erlaubt.")
+        block = self.trade_block(m.terminal_info(), acc)
+        if block != self.trade_block_msg:
+            if block is None:
+                log.info("Handel über die MT5-Python-API ist erlaubt.")
             else:
-                log.error("Algo-Handel ist im MT5-Terminal AUS (Knopf 'Algo Trading' oben) - "
-                          "es werden keine neuen Orders platziert.")
-        self.trading_ok = allowed
+                log.error(f"KEIN HANDEL: {block}. Der Bot beobachtet weiter, platziert aber keine neuen Orders.")
+        self.trade_block_msg = block
+        self.trading_ok = block is None
         return True
+
+    @staticmethod
+    def trade_block(term, acc):
+        """None, wenn der Bot über die API handeln darf - sonst der Grund und was zu tun ist."""
+        if term is None or acc is None:
+            return "keine Verbindung zum MT5-Terminal"
+        if not getattr(term, "trade_allowed", True):
+            return "Algo-Handel ist im MT5-Terminal AUS - oben in der Leiste auf 'Algo Trading' klicken"
+        if getattr(term, "tradeapi_disabled", False):
+            return ("Handel über die Python-API ist im MT5 gesperrt - Extras -> Optionen -> Expert Advisors: "
+                    "den Haken bei 'Algo-Handel über externe Python-API deaktivieren' entfernen")
+        if not getattr(acc, "trade_allowed", True):
+            return ("dieses Konto darf nicht handeln - meist mit dem Investor-Passwort (nur Lesen) eingeloggt; "
+                    "mit dem normalen Passwort neu einloggen")
+        if not getattr(acc, "trade_expert", True):
+            return "der Broker erlaubt auf diesem Konto keinen Automatik-Handel"
+        return None
 
     def ensure_symbols(self):
         m = self.mt5
@@ -453,8 +491,8 @@ class SmcBot:
                 return True
             if res is None or res.retcode not in RETRY_SAFE:
                 break
-        log.error(f"{pos.symbol}: Schließen von {pos.ticket} FEHLGESCHLAGEN (Retcode "
-                  f"{res.retcode if res else m.last_error()}) - neuer Versuch folgt.")
+        log.error(f"{pos.symbol}: Schließen von {pos.ticket} FEHLGESCHLAGEN ({failure_text(res, m)}) "
+                  f"- neuer Versuch folgt.")
         return False
 
     def cancel_order(self, order, why: str) -> bool:
@@ -470,7 +508,7 @@ class SmcBot:
                           "richtung": plan.get("dir", ""), "entry": plan.get("entry", ""), "grund": why})
         else:
             log.error(f"{order.symbol}: Löschen von Order {order.ticket} fehlgeschlagen "
-                      f"({res.retcode if res else m.last_error()}) - neuer Versuch folgt.")
+                      f"({failure_text(res, m)}) - neuer Versuch folgt.")
         return ok
 
     # ------------------------------------------------------------------ Wächter
@@ -705,7 +743,7 @@ class SmcBot:
                           "entry": o["entry"], "sl": o["sl"], "tp": o["tp"], "grund": reason, "setup": chain})
 
         if not self.trading_ok:
-            return skip("Algo-Handel im Terminal aus")
+            return skip(f"kein Handel erlaubt: {self.trade_block_msg}")
         if self.clock_ok is not True:
             return skip("Broker-Serverzeit nicht bestätigt (SERVER_TZ prüfen)")
         if self.state.get("kill"):
@@ -755,7 +793,7 @@ class SmcBot:
                "comment": f"ADF {o['armed_t']}"[:31], **timing}
         res = self.send(req, self.fillings(info, pending=True))
         if res is None or res.retcode not in OK_RETCODES:
-            return skip(f"Broker hat abgelehnt (Retcode {res.retcode if res else m.last_error()})")
+            return skip(f"Order abgelehnt ({failure_text(res, m)})")
         self.state["plans"][str(res.order)] = {
             "key": key, "symbol": sym, "dir": o["dir"], "armed_t": o["armed_t"], "entry": entry,
             "sl": sl, "tp": tp, "lots": lots, "risk_money": risk_money, "chain": chain,
@@ -788,7 +826,8 @@ class SmcBot:
         eq = f"Kapital {acc.equity:.2f} {acc.currency}" if acc else "Kapital ?"
         log.info(f"♥ {ny_ts(self.now()):%H:%M} New York - {eq}, {len(self.my_positions() or [])} Position(en), "
                  f"{len(self.my_orders() or [])} Limit-Order(s){' - TAGESGRENZE AKTIV' if self.state.get('kill') else ''}"
-                 f"{'' if self.clock_ok else ' - SERVERZEIT NICHT BESTÄTIGT'}")
+                 f"{'' if self.clock_ok else ' - SERVERZEIT NICHT BESTÄTIGT'}"
+                 f"{'' if self.trading_ok else ' - HANDEL GESPERRT (siehe Fehler oben)'}")
         for key in self.symbols:
             log.info(f"   {key:<6} {self.status.get(key, 'warte auf Daten / Markt geschlossen')}")
 

@@ -39,7 +39,9 @@ class FakeMT5:
         self.orders, self.positions, self.deals = {}, {}, []
         self.next_ticket = 1000
         self.sent = []                             # every order_send request (for assertions)
-        self.trade_allowed = True
+        self.trade_allowed = True                  # "Algo Trading" button
+        self.tradeapi_disabled = False             # option: no trading via the external Python API
+        self.account_trade_allowed = True          # False when logged in with the investor password
 
     # ---------------------------------------------------------------- clock / broker sim
     def offset(self, utc):
@@ -121,7 +123,8 @@ class FakeMT5:
         return (1, "Success")
 
     def terminal_info(self):
-        return SimpleNamespace(connected=True, trade_allowed=self.trade_allowed)
+        return SimpleNamespace(connected=True, trade_allowed=self.trade_allowed,
+                               tradeapi_disabled=self.tradeapi_disabled)
 
     def account_info(self):
         floating = 0.0
@@ -131,7 +134,8 @@ class FakeMT5:
         eq = self.balance + floating
         return SimpleNamespace(login=self.login, server="Fake-Demo", currency="USD", balance=self.balance, equity=eq,
                                margin_free=eq, trade_mode=self.ACCOUNT_TRADE_MODE_DEMO if self.demo
-                               else self.ACCOUNT_TRADE_MODE_REAL)
+                               else self.ACCOUNT_TRADE_MODE_REAL, trade_allowed=self.account_trade_allowed,
+                               trade_expert=True)
 
     def symbol_info(self, s):
         if s not in self.bars:
@@ -187,6 +191,8 @@ class FakeMT5:
         res = lambda code, order=0: SimpleNamespace(retcode=code, order=order, deal=0, price=req.get("price", 0.0),
                                                     comment="")
         a = req["action"]
+        if not self.trade_allowed or self.tradeapi_disabled:
+            return res(10027)  # algo trading disabled by the client terminal
         if a == self.TRADE_ACTION_PENDING:
             if req.get("type_filling") != self.ORDER_FILLING_RETURN:
                 return res(10030)
