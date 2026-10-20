@@ -3,9 +3,13 @@ title Aktien Data Farm - MT5-Autopilot
 color 0A
 REM Doppelklick unter Windows startet den Autopiloten (nur Demokonto)
 cd /d "%~dp0"
-set PY=python
-where py >nul 2>nul
-if %errorlevel%==0 set PY=py
+REM Python-Version, fuer die es das MetaTrader5-Paket sicher gibt - sonst die Standard-Version
+set PY=
+for %%v in (3.12 3.11 3.13) do (
+  if not defined PY py -%%v --version >nul 2>&1 && set "PY=py -%%v"
+)
+if not defined PY where py >nul 2>nul && set "PY=py"
+if not defined PY set "PY=python"
 %PY% --version >nul 2>&1
 if errorlevel 1 (
   echo FEHLER: Python nicht gefunden! Python 3.12 installieren, Haken bei "Add Python to PATH".
@@ -19,7 +23,8 @@ if not exist ..\.venv (
 call ..\.venv\Scripts\activate.bat
 pip install -q "pandas>=2.0" "numpy>=1.24" MetaTrader5
 if errorlevel 1 (
-  echo FEHLER bei der Installation. Siehe ANLEITUNG_MT5.md - Abschnitt Probleme.
+  echo FEHLER bei der Installation. Python 3.12 installieren, den Ordner .venv neben
+  echo dem Ordner mt5 loeschen und diese Datei erneut starten. Siehe ANLEITUNG_MT5.md - Probleme.
   pause
   exit /b 1
 )
