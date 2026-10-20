@@ -1,7 +1,7 @@
 # MT5-Autopilot: die Data Farm handelt selbst (Demokonto)
 
-Der Autopilot nimmt **dieselbe Strategie** wie das Dashboard und das TradingView-Script
-(Sweep → MSS → FVG/OB) und handelt sie selbstständig auf einem **MetaTrader-5-Demokonto**.
+Der Autopilot handelt die SMC-Strategie (Sweep → MSS → FVG/OB) selbstständig auf einem
+**MetaTrader-5-Demokonto**.
 Das Sicherheitskonzept stammt von deinem Trend-Bot und wurde erweitert.
 
 > Der Bot startet **nur auf Demokonten**. Lass ihn dort mehrere Wochen laufen und vergleiche
@@ -45,7 +45,7 @@ Gestoppt wird mit **Strg + C**. Dabei werden wartende Limit-Orders gelöscht.
 Offene Positionen behalten ihren Stop-Loss und Take-Profit beim Broker, werden ohne laufenden
 Bot aber **nicht zum Schluss glattgestellt**.
 
-**Wichtig:** Anders als die TradingView-Alarme läuft der Autopilot **auf deinem PC**.
+**Wichtig:** Der Autopilot läuft **auf deinem PC**.
 Der PC muss während der US-Handelszeit an sein, also 15:30–22:00 Uhr deutscher Zeit.
 
 ## Was der Bot macht
@@ -53,7 +53,7 @@ Der PC muss während der US-Handelszeit an sein, also 15:30–22:00 Uhr deutsche
 Bei jeder neuen 5-Minuten-Kerze in der regulären US-Handelszeit:
 
 1. Er holt die Kerzen von MT5 und rechnet die Broker-Serverzeit automatisch in New-York-Zeit um.
-2. Er lässt dieselbe Erkennung und Engine laufen wie das Dashboard. Die Einstellungen kommen aus `../config.json`.
+2. Er lässt die Mustererkennung und die Engine laufen. Die Einstellungen kommen aus `../config.json`.
 3. Hat die Engine **genau auf dieser Kerze** ein Setup scharf gemacht, setzt er eine
    **Limit-Order mit Stop-Loss und Take-Profit** beim Broker.
 4. Verwirft die Engine das Setup (kein Retest, Kurs weggelaufen, Zeit abgelaufen),
@@ -104,4 +104,4 @@ Kennung (`MAGIC_NUMBER = 200002`) und fasst die Trades des anderen Bots nicht an
 | `Order abgelehnt (Retcode …)` | Hinter der Nummer steht der Grund, z.B. „Markt geschlossen“. Steht keiner dabei, die Nummer im MT5-Journal nachsehen oder mir schicken. |
 | `Die PC-Uhr geht … s vor/nach` | Windows: Einstellungen → Zeit und Sprache → Datum und Uhrzeit → „Jetzt synchronisieren“. Der Bot merkt es selbst, wenn die Uhr wieder stimmt. |
 | `Broker erlaubt keine Ablaufzeit für Limit-Orders` | Bei diesem Broker verfallen Limit-Orders nicht von selbst. Der Bot handelt dort nicht, weil eine Order sonst nach einem Absturz noch nach Börsenschluss gefüllt werden könnte. Ein anderer Broker bzw. anderes Demokonto ist nötig. |
-| Es kommen keine Orders | Das ist normal, die Strategie ist sehr wählerisch: Im Backtest mit echten Kursen gab es bei 5 Aktien **20 Trades in 60 Tagen**, also nur alle paar Tage einen. Orders kommen nur von 15:45 bis 21:30 Uhr deutscher Zeit. Außerhalb steht im Status „warte auf Daten / Markt geschlossen“. Die Gründe für ausgelassene Setups stehen als `SKIP` im Journal, und im Dashboard siehst du, warum die Engine Setups ablehnt. |
+| Es kommen keine Orders | Das ist normal, die Strategie ist sehr wählerisch: Im Backtest mit echten Kursen gab es bei 5 Aktien **20 Trades in 60 Tagen**, also nur alle paar Tage einen. Orders kommen nur von 15:45 bis 21:30 Uhr deutscher Zeit. Außerhalb steht im Status „warte auf Daten / Markt geschlossen“. Die Gründe für ausgelassene Setups stehen als `SKIP` im Journal. |
