@@ -4,7 +4,7 @@ MT5-Autopilot der Aktien Data Farm - SMC-Engine (Sweep -> MSS -> FVG/OB) auf US-
 Ablauf bei jeder neu geschlossenen 5-Minuten-Kerze (reguläre US-Handelszeit):
   1. Kerzen vom MT5-Terminal holen; Broker-Serverzeit pro Kerze (sommer-/winterzeitfest)
      in New-York-Zeit umrechnen
-  2. Dieselbe Erkennung + Engine wie im Dashboard laufen lassen (farmlib)
+  2. Mustererkennung + Engine laufen lassen (farmlib, Einstellungen aus ../config.json)
   3. Hat die Engine GENAU AUF DIESER KERZE ein Setup scharf gemacht:
      Limit-Order beim Broker MIT Stop-Loss, Take-Profit und Ablaufzeit platzieren
   4. Hält die Engine das Setup nicht mehr (kein Retest, weggelaufen, ...):

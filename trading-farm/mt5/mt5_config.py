@@ -2,7 +2,7 @@
 Einstellungen des MT5-Autopiloten der Aktien Data Farm.
 
 Die STRATEGIE (Sweep -> MSS -> FVG/OB, Zeitfenster, Chance-Risiko usw.) steht in
-../config.json und ist dieselbe wie im Dashboard und im TradingView-Script.
+../config.json.
 Hier steht nur, WIE und WO gehandelt wird.
 
 WICHTIG: Der Bot ist für DEMO-KONTEN gebaut. ALLOW_REAL_ACCOUNT steht auf False,
