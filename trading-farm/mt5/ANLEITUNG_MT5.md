@@ -14,9 +14,10 @@ Das Sicherheitskonzept stammt von deinem Trend-Bot und wurde erweitert.
    AAPL oder TSLA gibt.
 2. **Python** (wie beim Trend-Bot). Am besten Python 3.12, weil das MetaTrader5-Paket nicht
    immer sofort die neueste Python-Version unterstützt.
-3. **Symbolnamen eintragen:** In `mt5_config.py` unter `MARKETS` die Namen deines Brokers
-   eintragen, zum Beispiel `"NVDA": "NVDA.US"`. Findet der Bot ein Symbol nicht, schreibt er
-   beim Start passende Namen ins Fenster.
+3. **Symbolnamen:** Übliche Broker-Namen wie `NVDA.US`, `#NVDA` oder `NVDAm` erkennt der Bot
+   beim Start selbst und schreibt ins Fenster, welchen Namen er nimmt. Gibt es mehrere passende
+   Namen, rät er nicht, sondern listet sie auf. Dann den richtigen in `mt5_config.py` unter
+   `MARKETS` eintragen, zum Beispiel `"NVDA": "NVDA.US"`.
 4. **Serverzeit-Regel prüfen:** MT5 liefert alle Kerzen in der Uhrzeit des Brokers. Die meisten
    Broker laufen auf „New York + 7 Stunden“, das ist in `mt5_config.py` als `SERVER_TZ = "NY+7"`
    voreingestellt. Der Bot prüft das an den Live-Kursen, sobald neue Kurse hereinkommen. Passt
@@ -98,7 +99,7 @@ Kennung (`MAGIC_NUMBER = 200002`) und fasst die Trades des anderen Bots nicht an
 | Meldung | Lösung |
 |---|---|
 | `MetaTrader5-Paket fehlt` / Installation schlägt fehl | Python 3.12 installieren und `start_mt5_bot.bat` erneut starten |
-| `Symbol 'NVDA' beim Broker nicht gefunden` | Den vorgeschlagenen Namen in `mt5_config.py` → `MARKETS` eintragen |
+| `Symbol 'NVDA' beim Broker nicht gefunden` | Den vorgeschlagenen Namen in `mt5_config.py` → `MARKETS` eintragen. Bietet dein Broker die Aktie gar nicht an, lässt der Bot sie einfach weg. |
 | `MT5-Initialisierung fehlgeschlagen` | MT5 starten und einloggen. Bot und MT5 beide normal starten, nicht eins davon „Als Administrator“. Sind mehrere MT5 installiert, in `mt5_config.py` bei `MT5_PATH` den Pfad zur richtigen `terminal64.exe` eintragen. |
 | `KEIN HANDEL: …` | Die Zeile sagt, was zu tun ist: „Algo Trading“ einschalten, den Haken für die Python-API-Sperre entfernen (Schritt 2 unter „Starten“) oder mit dem normalen statt dem Investor-Passwort einloggen. |
 | `Order abgelehnt (Retcode …)` | Hinter der Nummer steht der Grund, z.B. „Markt geschlossen“. Steht keiner dabei, die Nummer im MT5-Journal nachsehen oder mir schicken. |

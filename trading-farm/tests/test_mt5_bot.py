@@ -206,6 +206,22 @@ class Safety(unittest.TestCase):
         self.assertTrue(fake.sent)
         self.assertIn("Retcode 10027: Algo-Handel", (Path(self.tmp.name) / C.JOURNAL_FILE).read_text(encoding="utf-8"))
 
+    def test_broker_symbol_name_is_found(self):
+        C.MARKETS = {"TST": "TST"}             # broker calls it TST.US
+        fake, bot = self.bot()
+        bot.connect()
+        self.assertEqual(bot.symbols, {"TST": "TST.US"})
+
+    def test_ambiguous_symbol_name_is_not_guessed(self):
+        C.MARKETS = {"TST": "TST"}
+        df = data.make_demo("TST", days=3, seed=1, end="2026-10-16")
+        fake = FakeMT5({"TST.US": df, "TST.NAS": df})
+        fake.advance_to(int(df.t.iloc[100]) + 305)
+        bot = SmcBot(fake, clock=lambda: fake.now, cfg=CFG, workdir=Path(self.tmp.name))
+        with self.assertLogs("bot_smc", "WARNING") as logs, self.assertRaises(SystemExit):
+            bot.connect()
+        self.assertIn("TST.US, TST.NAS", "\n".join(logs.output))
+
     def test_no_retry_after_partial_fill(self):
         fake, bot = self.bot()
         calls = []

@@ -31,6 +31,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -289,15 +290,29 @@ class SmcBot:
             return "der Broker erlaubt auf diesem Konto keinen Automatik-Handel"
         return None
 
+    def find_symbol(self, key, sym):
+        """Der eingetragene Name - sonst die EINE Broker-Variante desselben Tickers (NVDA.US, #NVDA, NVDAm).
+        Gibt (Name oder None, Vorschläge) zurück; bei mehreren Varianten wird nichts geraten."""
+        m = self.mt5
+        if m.symbol_info(sym) is not None:
+            return sym, []
+        names = [s.name for s in (m.symbols_get(group=f"*{key}*") or [])]
+        same = re.compile(rf"#?{re.escape(key)}(?:[._-][A-Za-z0-9]{{1,6}}|[a-z])?")
+        hits = [n for n in names if same.fullmatch(n)]
+        return (hits[0] if len(hits) == 1 else None), (hits or names)[:8]
+
     def ensure_symbols(self):
         m = self.mt5
-        for key, sym in C.MARKETS.items():
-            info = m.symbol_info(sym)
+        for key, wanted in C.MARKETS.items():
+            sym, hints = self.find_symbol(key, wanted)
+            info = m.symbol_info(sym) if sym else None
             if info is None:
-                hints = [s.name for s in (m.symbols_get(group=f"*{key}*") or [])][:8]
-                log.warning(f"{key}: Symbol '{sym}' beim Broker nicht gefunden - übersprungen."
-                            + (f" Mögliche Namen: {', '.join(hints)}" if hints else ""))
+                log.warning(f"{key}: Symbol '{wanted}' beim Broker nicht gefunden - übersprungen."
+                            + (f" Mögliche Namen: {', '.join(hints)} - den richtigen in mt5_config.py "
+                               f"unter MARKETS eintragen." if hints else ""))
                 continue
+            if sym != wanted:
+                log.info(f"{key}: '{wanted}' gibt es beim Broker nicht - nehme '{sym}' (automatisch erkannt).")
             if not info.visible:
                 m.symbol_select(sym, True)
             self.symbols[key] = sym
