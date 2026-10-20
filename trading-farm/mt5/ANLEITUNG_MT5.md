@@ -48,6 +48,9 @@ Bot aber **nicht zum Schluss glattgestellt**.
 
 **Wichtig:** Der Autopilot läuft **auf deinem PC**.
 Der PC muss während der US-Handelszeit an sein, also 15:30–22:00 Uhr deutscher Zeit.
+Ausnahme: Wenn Europa und die USA die Uhren an verschiedenen Tagen umstellen, ist es eine
+Stunde früher (14:30–21:00 Uhr). 2026 betrifft das den 25.10. bis 31.10.; im März meist
+zwei bis drei Wochen.
 
 ## Was der Bot macht
 
